@@ -1,0 +1,4 @@
+translate = ["Sub32"]
+imports = ["!*"]
+trusted = []
+trust_proofgen = false

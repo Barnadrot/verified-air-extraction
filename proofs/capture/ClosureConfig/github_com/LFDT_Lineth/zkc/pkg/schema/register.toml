@@ -1,0 +1,7 @@
+translate = ["Id", "Register", "Register.IsNative", "Register.Width", "Register.Name", "Register.IsInput", "Register.IsOutput", "Type", "INPUT_REGISTER", "OUTPUT_REGISTER"]
+trusted = []
+translate_types = true
+trust_proofgen = false
+
+
+imports = ["github.com/LFDT-Lineth/zkc/*", "math", "math/big", "math/bits", "fmt", "io", "strings", "bytes", "cmp", "errors", "iter"]

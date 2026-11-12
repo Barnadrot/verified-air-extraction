@@ -1,0 +1,3740 @@
+// Package goose implements conversion from Go source to Perennial definitions.
+//
+// The exposed interface allows converting individual files as well as whole
+// packages to a single Lean file with all the converted definitions, which
+// include user-defined structs in Go as Lean structures and a GooseLang
+// function for each Go function.
+//
+// See goose/README.md for a high-level overview.
+package goose
+
+import (
+	"fmt"
+	"go/ast"
+	"go/constant"
+	"go/token"
+	"go/types"
+	"iter"
+	"log"
+	"math"
+	"math/big"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/mit-pdos/perennial/goose/declfilter"
+	"github.com/mit-pdos/perennial/goose/glang"
+	"github.com/mit-pdos/perennial/goose/util"
+	"github.com/mit-pdos/perennial/goose/util/toposort"
+	"golang.org/x/tools/go/packages"
+)
+
+type outputDecls struct {
+	importDecls    []glang.Decl
+	typeNamedDecls []glang.Decl
+	typeAliasDecls []glang.Decl
+	constDecls     []glang.Decl
+	varDecls       []glang.Decl
+	funcDecls      []glang.Decl
+	funcImplDecls  []glang.Decl
+	finalDecls     []glang.Decl
+}
+
+func (o *outputDecls) decls() []glang.Decl {
+	return slices.Concat(
+		o.typeNamedDecls,
+		o.typeAliasDecls,
+		o.constDecls,
+		o.varDecls,
+		o.funcDecls,
+		o.funcImplDecls,
+		o.finalDecls,
+	)
+}
+
+func (o *outputDecls) preHeaderDecls() []glang.Decl {
+	return o.importDecls
+}
+
+// Ctx is a context for resolving Go code's types and source code
+type Ctx struct {
+	info    *types.Info
+	pkgPath string
+
+	// The name of the GoString holding the package's full path (see
+	// glang.LeanPkgId).
+	pkgIdent string
+	errorReporter
+
+	// the package uses an FFI (and so has no FfiSyntax parameter)
+	hasFfi bool
+
+	// XXX: this is so we can determine the expected return type when handling a
+	// `returnStmt` so the appropriate conversion is inserted
+	curFuncType   *types.Signature
+	defaultReturn glang.Expr // this handles
+
+	// The function's own body (outside nested function literals) has a defer
+	// statement: set by beginFuncBody before the body is translated. Such a
+	// function is wrapped with `with_defer:` (or `with_defer_recover:`), its
+	// `return e1, ..., en` assigns its results, and it returns the results'
+	// values after its deferred calls have run (which may modify named results).
+	usesDefer bool
+	// The types of the current function's results. In a function that defers,
+	// result i is held by the cell `$res<i>` (a named result's own variable, a
+	// fresh one for an unnamed or blank result).
+	resultTypes []glang.Expr
+
+	// Set when the function's own body defers a function literal that calls
+	// recover(): the function is wrapped with `with_defer_recover:`, which binds
+	// the `$panic` cell that recover() reads and clears.
+	usesRecover bool
+	// recover() is translated only when this is set: directly in a function
+	// literal that is the operand of a `defer` statement.
+	recoverOK bool
+	// the next function literal translated is the operand of a `defer`
+	nextFuncLitDeferred bool
+
+	globalVars     []*ast.Ident
+	functions      []*ast.FuncDecl
+	namedTypeSpecs []*ast.TypeSpec
+	localTypes     map[string]bool // names of the types declared in functions
+
+	importNames        map[string]*types.PkgName
+	importNamesOrdered []*types.PkgName
+	// Full Go import path -> Assumptions class field name. For colliding
+	// package names, imports ending in "a/v1" and "b/v1" become
+	// "import_a_v1_Assumption" and "import_b_v1_Assumption" rather than both
+	// using package name "v1".
+	importAssumptions map[string]string
+
+	inits []glang.Expr
+	// whether an init function is trusted (its model is `init.impl`)
+	trustedInit bool
+
+	filter declfilter.DeclFilter
+	out    outputDecls
+}
+
+// NewPkgCtx initializes a context based on a properly loaded package
+func NewPkgCtx(pkg *packages.Package, filter declfilter.DeclFilter) Ctx {
+	return Ctx{
+		info:              pkg.TypesInfo,
+		pkgPath:           pkg.PkgPath,
+		hasFfi:            util.GetFfi(pkg) != "",
+		pkgIdent:          glang.LeanPkgId(pkg.PkgPath),
+		errorReporter:     newErrorReporter(pkg.Fset),
+		importNames:       make(map[string]*types.PkgName),
+		importAssumptions: make(map[string]string),
+		filter:            filter,
+		localTypes:        make(map[string]bool),
+	}
+}
+
+func (ctx *Ctx) paramList(fs *ast.FieldList) (names []glang.Binder, types []glang.Expr) {
+	for _, f := range fs.List {
+		for _, name := range f.Names {
+			names = append(names, glang.Binder{
+				Name: name.Name,
+			})
+			types = append(types, ctx.glangType(f, ctx.typeOf(f.Type)))
+		}
+		if len(f.Names) == 0 { // Unnamed parameter
+			names = append(names, glang.Binder{
+				Name: "_",
+			})
+			types = append(types, ctx.glangType(f, ctx.typeOf(f.Type)))
+		}
+	}
+	return names, types
+}
+
+func (ctx *Ctx) termIdent(x string) glang.Expr {
+	return glang.TermIdent(x)
+}
+
+func (ctx *Ctx) typeParamList(fs *ast.FieldList) []string {
+	var typeParams []string
+	if fs == nil {
+		return nil
+	}
+	for _, f := range fs.List {
+		for _, name := range f.Names {
+			typeParams = append(typeParams, name.Name)
+		}
+
+		if len(f.Names) == 0 { // Unnamed parameter
+			ctx.unsupported(fs, "unnamed type parameters")
+		}
+	}
+	return typeParams
+}
+
+func addSourceDoc(doc *ast.CommentGroup, comment *string) {
+	if doc == nil {
+		return
+	}
+	if *comment != "" {
+		*comment += "\n\n"
+	}
+	*comment += strings.TrimSuffix(doc.Text(), "\n")
+}
+
+func (ctx *Ctx) addSourceFile(d *ast.FuncDecl, comment *string) {
+	if *comment != "" {
+		*comment += "\n\n"
+	}
+	f := ctx.fset.Position(d.Name.Pos())
+	f.Filename = filepath.Base(f.Filename)
+	*comment += "go: " + f.String()
+}
+
+// TODO: make this the input to handleImplicitConversion?
+type exprWithInfo struct {
+	e glang.Expr
+	t types.Type // for conversions
+	n ast.Node   // for printing a location in error messages
+}
+
+func (ctx *Ctx) sliceLiteralAux(es []exprWithInfo, expectedType types.Type) glang.Expr {
+	var expr glang.Expr = glang.VerbatimExpr("#slice.nil")
+
+	if len(es) > 0 {
+		var sliceLitArgs []glang.Expr
+		for i := 0; i < len(es); i++ {
+			sliceLitArgs = append(sliceLitArgs,
+				glang.NewCallExpr(
+					glang.VerbatimExpr("KeyedElement"),
+					glang.VerbatimExpr("None"),
+					glang.NewCallExpr(
+						glang.VerbatimExpr("ElementExpression"),
+						ctx.glangType(es[i].n, expectedType),
+						glang.IdentExpr(fmt.Sprintf("$sl%d", i))),
+				),
+			)
+		}
+		expr = glang.NewCallExpr(glang.VerbatimExpr("CompositeLiteral"),
+			ctx.glangType(es[0].n, types.NewSlice(expectedType)),
+			glang.NewCallExpr(glang.VerbatimExpr("LiteralValue"), glang.ListExpr(sliceLitArgs)),
+		)
+
+		for i := len(es); i > 0; i-- {
+			expr = glang.LetExpr{
+				Names:   []string{fmt.Sprintf("$sl%d", i-1)},
+				ValExpr: ctx.handleImplicitConversion(es[i-1].n, es[i-1].t, expectedType, es[i-1].e),
+				Cont:    expr,
+			}
+		}
+		expr = glang.ParenExpr{Inner: expr}
+	}
+	return expr
+}
+
+// Deals with the arguments, but does not actually invoke the function. That
+// should be done in the continuation. The continuation can assume the arguments
+// are bound to "a0", "$a1", ....
+func (ctx *Ctx) callExprPrelude(call *ast.CallExpr, cont glang.Expr) (expr glang.Expr) {
+	funcSig, ok := ctx.typeOf(call.Fun).Underlying().(*types.Signature)
+	if !ok {
+		ctx.nope(call.Fun, "function should have signature type, got %T", types.Unalias(ctx.typeOf(call.Fun)))
+	}
+
+	expr = cont
+
+	var intermediates []exprWithInfo
+	intermediatesDone := false
+	// look for special case of multi-return pass through
+	if len(call.Args) == 1 {
+		if tupleType, ok := ctx.typeOf(call.Args[0]).(*types.Tuple); ok {
+			intermediatesDone = true
+			for i := range tupleType.Len() {
+				intermediates = append(intermediates,
+					exprWithInfo{
+						e: glang.IdentExpr(fmt.Sprintf("$ret%d", i)),
+						t: tupleType.At(i).Type(),
+						n: call.Args[0],
+					})
+			}
+			// destructure the inner call at the end
+			defer func() {
+				var names []string
+				for i := range tupleType.Len() {
+					names = append(names, fmt.Sprintf("$ret%d", i))
+				}
+				expr = glang.LetExpr{
+					Names:   names,
+					ValExpr: glang.ParenExpr{Inner: ctx.expr(call.Args[0])},
+					Cont:    expr,
+				}
+			}()
+		}
+	}
+	if !intermediatesDone {
+		for i := range len(call.Args) {
+			intermediates = append(intermediates,
+				exprWithInfo{
+					e: ctx.expr(call.Args[i]),
+					t: ctx.typeOf(call.Args[i]),
+					n: call.Args[i],
+				})
+		}
+	}
+
+	var i int = funcSig.Params().Len()
+	if funcSig.Variadic() && call.Ellipsis == token.NoPos {
+		// construct a slice literal for all the arguments including and after
+		// the last one listed in funcSig.
+		expr = glang.LetExpr{
+			Names: []string{fmt.Sprintf("$a%d", i-1)},
+			ValExpr: ctx.sliceLiteralAux(intermediates[i-1:],
+				funcSig.Params().At(i-1).Type().(*types.Slice).Elem()),
+			Cont: expr,
+		}
+		i--
+	}
+	for ; i > 0; i-- {
+		paramTy := funcSig.Params().At(i - 1).Type()
+		// `append(b, s...)` with a string `s` (the only variadic string
+		// parameter) appends the bytes of `s`, as `[]byte(s)...` does.
+		if b, ok := paramTy.Underlying().(*types.Basic); ok && funcSig.Variadic() &&
+			i == funcSig.Params().Len() && b.Info()&types.IsString != 0 {
+			paramTy = types.NewSlice(types.Universe.Lookup("byte").Type())
+		}
+		expr = glang.LetExpr{
+			Names: []string{fmt.Sprintf("$a%d", i-1)},
+			ValExpr: ctx.handleImplicitConversion(intermediates[i-1].n,
+				intermediates[i-1].t, paramTy, intermediates[i-1].e),
+			Cont: expr,
+		}
+	}
+	return
+}
+
+func (ctx *Ctx) conversionExpr(s *ast.CallExpr) glang.Expr {
+	if len(s.Args) != 1 {
+		ctx.nope(s, "expect exactly one argument in a conversion")
+	}
+	toType := ctx.info.TypeOf(s.Fun)
+	fromType := ctx.info.TypeOf(s.Args[0])
+	if isUnsafePointer(toType) && isUintptr(fromType) {
+		return ctx.uintptrToPointer(s, s.Args[0])
+	}
+	return ctx.handleImplicitConversion(s, fromType, toType, ctx.expr(s.Args[0]))
+}
+
+func isUnsafePointer(t types.Type) bool {
+	b, ok := t.Underlying().(*types.Basic)
+	return ok && b.Kind() == types.UnsafePointer
+}
+
+func isUintptr(t types.Type) bool {
+	b, ok := t.Underlying().(*types.Basic)
+	return ok && b.Kind() == types.Uintptr
+}
+
+// callUnsafe is a call of the model of a function of package unsafe (unsafe.Add,
+// unsafe.Slice; see go.UnsafeSemantics in Golang/Defn/Predeclared.lean).
+func callUnsafe(name string, tyArgs glang.ListExpr, args ...glang.Expr) glang.Expr {
+	return glang.NewCallExpr(
+		glang.NewCallExpr(glang.VerbatimExpr("FuncResolve"),
+			glang.VerbatimExpr("«unsafe»."+name), tyArgs, glang.Tt),
+		args...)
+}
+
+// bindInOrder evaluates es left to right (Go's order for operands), naming their values
+// $u0, $u1, ..., then cont, which refers to them.
+func bindInOrder(es []glang.Expr, cont glang.Expr) glang.Expr {
+	for i := len(es) - 1; i >= 0; i-- {
+		cont = glang.LetExpr{Names: []string{fmt.Sprintf("$u%d", i)}, ValExpr: es[i], Cont: cont}
+	}
+	return cont
+}
+
+func unsafeArg(i int) glang.Expr { return glang.IdentExpr(fmt.Sprintf("$u%d", i)) }
+
+// unsafeBuiltin translates unsafe.Add and unsafe.Slice (Sizeof, Offsetof and Alignof are
+// constants; the other functions of package unsafe are not supported). The length is
+// converted to an int, as the semantics takes it.
+func (ctx *Ctx) unsafeBuiltin(s *ast.CallExpr, name string) (glang.Expr, bool) {
+	var call glang.Expr
+	switch name {
+	case "Add":
+		call = callUnsafe("Add", glang.ListExpr{}, unsafeArg(0), unsafeArg(1))
+	case "Slice":
+		ptrTy, ok := ctx.typeOf(s.Args[0]).Underlying().(*types.Pointer)
+		if !ok {
+			ctx.unsupported(s, "unsafe.Slice of a non-pointer")
+			return nil, true
+		}
+		call = callUnsafe("Slice", glang.ListExpr{ctx.glangType(s, ptrTy.Elem())},
+			unsafeArg(0), unsafeArg(1))
+	default:
+		return nil, false
+	}
+	n := ctx.handleImplicitConversion(s.Args[1], ctx.typeOf(s.Args[1]), types.Typ[types.Int],
+		ctx.expr(s.Args[1]))
+	return bindInOrder([]glang.Expr{ctx.expr(s.Args[0]), n}, call), true
+}
+
+// uintptrToPointer translates unsafe.Pointer(e) for e a uintptr: only the form
+// unsafe.Pointer(uintptr(p) + a + b + ...), with p an unsafe.Pointer, which is
+// unsafe.Add(p, a + b + ...): Go's rules for unsafe.Pointer allow the form only when the
+// result points into p's allocation, as unsafe.Add's do. Another term that converts a
+// pointer is an unspecified address (go.UnsafeSemantics.convert_pointer_to_uintptr).
+func (ctx *Ctx) uintptrToPointer(n locatable, e ast.Expr) glang.Expr {
+	// the terms of the sum, along its left spine
+	var terms []ast.Expr
+	cur := ast.Unparen(e)
+	for {
+		b, ok := cur.(*ast.BinaryExpr)
+		if !ok || b.Op != token.ADD {
+			break
+		}
+		terms = append([]ast.Expr{b.Y}, terms...)
+		cur = ast.Unparen(b.X)
+	}
+	call, ok := cur.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 || !isUintptr(ctx.typeOf(call)) ||
+		!isUnsafePointer(ctx.typeOf(call.Args[0])) || !ctx.info.Types[call.Fun].IsType() {
+		ctx.unsupported(n, "conversion of a uintptr to unsafe.Pointer other than unsafe.Pointer(uintptr(p) + offset)")
+		return nil
+	}
+	// the address must still be valid when it is converted back: nothing between the
+	// conversion and the end of the sum may move the stack
+	if !ctx.stackStable(call.Args[0]) {
+		ctx.unsupported(n, "unsafe.Pointer(uintptr(p) + offset) with a p that may move the stack")
+		return nil
+	}
+	for _, t := range terms {
+		if !ctx.stackStable(t) {
+			ctx.unsupported(n, "unsafe.Pointer(uintptr(p) + offset) with an offset that may move the stack")
+			return nil
+		}
+	}
+	uintptrTy := types.Typ[types.Uintptr]
+	var offset glang.Expr = glang.NewCallExpr(glang.VerbatimExpr("W64"), glang.ZLiteral{Value: big.NewInt(0)})
+	offset = glang.ToVal{Value: offset}
+	for i, t := range terms {
+		te := ctx.handleImplicitConversion(t, ctx.typeOf(t), uintptrTy, ctx.expr(t))
+		if i == 0 {
+			offset = te
+		} else {
+			offset = glang.BinaryExpr{X: offset, Op: glang.BinOp{OpId: glang.OpPlus,
+				Type: ctx.glangType(n, uintptrTy)}, Y: te}
+		}
+	}
+	offsetInt := glang.NewCallExpr(glang.VerbatimExpr("Convert"),
+		ctx.glangType(n, uintptrTy), ctx.glangType(n, types.Typ[types.Int]), offset)
+	return bindInOrder([]glang.Expr{ctx.expr(call.Args[0]), offsetInt},
+		callUnsafe("Add", glang.ListExpr{}, unsafeArg(0), unsafeArg(1)))
+}
+
+// pointerConversionOperand is p for an expression uintptr(p) with p an unsafe.Pointer.
+func (ctx *Ctx) pointerConversionOperand(e ast.Expr) (ast.Expr, bool) {
+	call, ok := ast.Unparen(e).(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 || !ctx.info.Types[call.Fun].IsType() ||
+		!isUintptr(ctx.typeOf(call)) || !isUnsafePointer(ctx.typeOf(call.Args[0])) {
+		return nil, false
+	}
+	return call.Args[0], true
+}
+
+// stackStable reports whether evaluating e cannot move the goroutine's stack, so that a
+// uintptr taken before it is still the address after it: e is built only from constants,
+// variables, fields, dereferences, &, indexes of arrays and slices, integer arithmetic,
+// and conversions between integers and of pointers to unsafe.Pointer. Anything else (a call, a receive, a
+// map index, a conversion that allocates, a string concatenation) may call the runtime,
+// which may grow and move the stack.
+func (ctx *Ctx) stackStable(e ast.Expr) bool {
+	if tv, ok := ctx.info.Types[e]; ok && tv.Value != nil {
+		return true
+	}
+	isIntOrPtr := func(t types.Type) bool {
+		switch u := t.Underlying().(type) {
+		case *types.Basic:
+			return u.Info()&types.IsInteger != 0 || u.Kind() == types.UnsafePointer
+		case *types.Pointer:
+			return true
+		}
+		return false
+	}
+	switch e := e.(type) {
+	case *ast.ParenExpr:
+		return ctx.stackStable(e.X)
+	case *ast.Ident:
+		_, isVar := ctx.info.Uses[e].(*types.Var)
+		return isVar
+	case *ast.SelectorExpr:
+		if sel := ctx.info.Selections[e]; sel != nil {
+			return sel.Kind() == types.FieldVal && ctx.stackStable(e.X)
+		}
+		_, isVar := ctx.info.Uses[e.Sel].(*types.Var)
+		return isVar
+	case *ast.StarExpr:
+		return ctx.stackStable(e.X)
+	case *ast.UnaryExpr:
+		switch e.Op {
+		case token.AND, token.ADD, token.SUB, token.XOR:
+			return ctx.stackStable(e.X)
+		}
+	case *ast.IndexExpr:
+		t := ctx.typeOf(e.X).Underlying()
+		if p, ok := t.(*types.Pointer); ok {
+			t = p.Elem().Underlying()
+		}
+		switch t.(type) {
+		case *types.Array, *types.Slice:
+			return ctx.stackStable(e.X) && ctx.stackStable(e.Index)
+		}
+	case *ast.BinaryExpr:
+		return isIntOrPtr(ctx.typeOf(e.X)) && isIntOrPtr(ctx.typeOf(e.Y)) &&
+			ctx.stackStable(e.X) && ctx.stackStable(e.Y)
+	case *ast.CallExpr:
+		// conversions between integers, and of a pointer to unsafe.Pointer; not from
+		// unsafe.Pointer to a pointer or from a uintptr to unsafe.Pointer, which a build
+		// with checkptr (-race, -d=checkptr) turns into runtime calls
+		if ctx.info.Types[e.Fun].IsType() && len(e.Args) == 1 {
+			to, from := ctx.typeOf(e), ctx.typeOf(e.Args[0])
+			isInt := func(t types.Type) bool {
+				b, ok := t.Underlying().(*types.Basic)
+				return ok && b.Info()&types.IsInteger != 0
+			}
+			_, fromPtr := from.Underlying().(*types.Pointer)
+			if (isInt(to) && isInt(from)) || (isUnsafePointer(to) && fromPtr) {
+				return ctx.stackStable(e.Args[0])
+			}
+		}
+	}
+	return false
+}
+
+// This handles:
+// - make() and new() because they uniquely take a type as a normal parameter.
+// - array len() and cap() because they are untyped functions
+func (ctx *Ctx) maybeHandleSpecialBuiltin(s *ast.CallExpr) (glang.Expr, bool) {
+	if !ctx.info.Types[s.Fun].IsBuiltin() {
+		return nil, false
+	}
+
+	f, ok := s.Fun.(*ast.Ident)
+	if !ok {
+		// A builtin of package unsafe: unsafe.Sizeof, Offsetof and Alignof are constants,
+		// which go/types computes for linux/amd64 (gc's layout; util.go loads the
+		// packages for that platform).
+		if ctx.info.Types[s].Value != nil {
+			return ctx.constantLiteral(s), true
+		}
+		if sel, ok := s.Fun.(*ast.SelectorExpr); ok {
+			if e, ok := ctx.unsafeBuiltin(s, sel.Sel.Name); ok {
+				return e, true
+			}
+		}
+		ctx.unsupported(s.Fun, "builtin that isn't an ident")
+	}
+
+	switch f.Name {
+	case "make":
+		sig := ctx.typeOf(s.Fun).(*types.Signature)
+		ty := ctx.glangType(s.Fun, sig.Params().At(0).Type())
+		switch sig.Params().Len() {
+		case 1:
+			return glang.NewCallExpr(
+				glang.NewCallExpr(glang.VerbatimExpr("FuncResolve"),
+					glang.VerbatimExpr("go.make1"), glang.ListExpr{ty}, glang.Tt),
+				glang.Tt), true
+		case 2:
+			return glang.NewCallExpr(
+				glang.NewCallExpr(glang.VerbatimExpr("FuncResolve"),
+					glang.VerbatimExpr("go.make2"), glang.ListExpr{ty}, glang.Tt),
+				ctx.expr(s.Args[1])), true
+		case 3:
+			return glang.NewCallExpr(
+				glang.NewCallExpr(glang.VerbatimExpr("FuncResolve"),
+					glang.VerbatimExpr("go.make3"), glang.ListExpr{ty}, glang.Tt),
+				ctx.expr(s.Args[1]), ctx.expr(s.Args[2])), true
+		default:
+			ctx.nope(s, "Too many or too few arguments to make")
+			return glang.CallExpr{}, true
+		}
+	case "new":
+		tv := ctx.info.Types[s.Args[0]]
+		var ty glang.Expr
+		var e glang.Expr
+		if tv.IsType() {
+			ty = ctx.glangType(s.Args[0], tv.Type)
+			e = glang.NewCallExpr(glang.VerbatimExpr("GoZeroVal"), ty, glang.Tt)
+		} else {
+			ty = ctx.glangType(s.Args[0], ctx.typeOf(s.Args[0]))
+			e = ctx.expr(s.Args[0])
+		}
+		return glang.NewCallExpr(glang.VerbatimExpr("GoAlloc"), ty, e), true
+	case "recover":
+		if !ctx.recoverOK {
+			ctx.unsupported(s, "recover() is supported only directly in a function literal "+
+				"deferred by a defer statement (defer func() { ... recover() ... }())")
+		}
+		return glang.NewCallExpr(glang.VerbatimExpr("recoverPanic"), glang.IdentExpr("$panic")), true
+	case "len", "cap":
+		// go/types gives the builtin a signature type exactly when the call is
+		// not constant-folded; then the ordinary call path applies the operand.
+		if _, ok := ctx.typeOf(s.Fun).(*types.Signature); ok {
+			return nil, false
+		}
+		// Otherwise it is a constant expression (len/cap of an array, len of a
+		// constant string) and go/types has the value. Emit it: there is no
+		// operand to apply go.len to, and Go does not evaluate one here.
+		if ctx.info.Types[s].Value == nil {
+			ctx.nope(s, "%s builtin is neither constant nor of signature type", f.Name)
+		}
+		return ctx.constantLiteral(s), true
+	}
+
+	return nil, false
+}
+
+func (ctx *Ctx) getNumParams(e ast.Expr) int {
+	funcSig, ok := ctx.typeOf(e).Underlying().(*types.Signature)
+	if !ok {
+		ctx.nope(e, "function should have signature type, got %T", types.Unalias(ctx.typeOf(e)))
+	}
+	return funcSig.Params().Len()
+}
+
+func (ctx *Ctx) callExpr(s *ast.CallExpr) glang.Expr {
+	if ctx.info.Types[s.Fun].IsType() {
+		return ctx.conversionExpr(s)
+	} else if e, ok := ctx.maybeHandleSpecialBuiltin(s); ok {
+		return e
+	} else {
+		var args []glang.Expr
+		for i := range ctx.getNumParams(s.Fun) {
+			args = append(args, glang.IdentExpr(fmt.Sprintf("$a%d", i)))
+		}
+		return ctx.callExprPrelude(s, glang.NewCallExpr(ctx.expr(s.Fun), args...))
+	}
+}
+
+func (ctx *Ctx) qualifiedName(obj types.Object) string {
+	name := obj.Name()
+	if obj.Pkg() == nil {
+		return name
+	} else if ctx.pkgPath == obj.Pkg().Path() {
+		// no module name needed
+		return name
+	}
+	return fmt.Sprintf("%s.%s", ctx.pkgRef(obj.Pkg()), name)
+}
+
+func (ctx *Ctx) selectorExprAddr(e *ast.SelectorExpr) glang.Expr {
+	selection := ctx.info.Selections[e]
+	if selection == nil {
+		if v, ok := ctx.info.ObjectOf(e.Sel).(*types.Var); ok {
+			return glang.NewCallExpr(glang.VerbatimExpr("GlobalVarAddr"),
+				ctx.termIdent(ctx.pkgRef(v.Pkg())+"."+v.Name()),
+				glang.Tt,
+			)
+		} else {
+			ctx.unsupported(e, "address of external package selection that is not a variable")
+		}
+	}
+
+	switch selection.Kind() {
+	case types.FieldVal:
+		if ctx.info.Types[e.X].Addressable() {
+			expr, curType, index := ctx.exprAddr(e.X), selection.Recv(), selection.Index()
+			ctx.fieldAddrSelection(e, index, &curType, &expr)
+			return expr
+		} else {
+			expr, curType, index := ctx.expr(e.X), selection.Recv(), selection.Index()
+			ctx.fieldSelection(e.X, &index, &curType, &expr)
+			if len(index) == 0 {
+				ctx.nope(e, "expected addressable expression")
+			}
+			ctx.fieldAddrSelection(e.X, index, &curType, &expr)
+			return expr
+		}
+	case types.MethodVal:
+		ctx.nope(e, "method val is not addressable")
+	case types.MethodExpr:
+		ctx.nope(e, "method expr is not addressable")
+	}
+	ctx.nope(e, "unexpected kind of selection")
+	panic("unreachable")
+}
+
+// Requires that `old(expr) : old(curType)` and that `old(curType)` be a struct
+// type. This walks down the selection specified by `index` up until it sees a
+// pointer field, then returns. Its intent is to be combined with
+// fieldAddrSelection to go the rest of the way.
+//
+// If len(index) > 0, then `expr : ptr<curType>`.
+// If len(index) == 0, then `expr : curType`.
+func (ctx *Ctx) fieldSelection(n locatable, index *[]int, curType *types.Type, expr *glang.Expr) {
+	for ; len(*index) > 0; *index = (*index)[1:] {
+		i := (*index)[0]
+		info, ok := ctx.getStructInfo(*curType)
+		if !ok {
+			ctx.nope(n, "expected (pointer to) struct type for base of selector, got %s", *curType)
+		}
+
+		if info.throughPointer {
+			// XXX: this is to feed into fieldAddrSelection (see comment above this func).
+			*curType = (*curType).(*types.Pointer).Elem()
+			return
+		}
+		v := info.structType.Field(i)
+		*expr = glang.NewCallExpr(glang.VerbatimExpr("StructFieldGet"),
+			ctx.structInfoToGlangType(info), glang.TermString(v.Name()), *expr)
+		*curType = v.Type()
+	}
+}
+
+// Requires `old(expr) : ptr<old(curType)>`.
+// This walks down the selection specified by `index` all the way to the end,
+// returning an expression representing the address of that selected field.
+func (ctx *Ctx) fieldAddrSelection(n locatable, index []int, curType *types.Type, expr *glang.Expr) {
+	for _, i := range index {
+		info, ok := ctx.getStructInfo(*curType)
+		if !ok {
+			if _, ok := (*curType).(*types.Struct); ok {
+				ctx.unsupported(n, "anonymous struct")
+			}
+			ctx.nope(n, "expected (pointer to) struct type for base of selector, got %s", *curType)
+		}
+		if info.throughPointer {
+			*expr = glang.DerefExpr{X: *expr, Ty: ctx.glangType(n, *curType)}
+		}
+		v := info.structType.Field(i)
+
+		*expr = glang.NewCallExpr(glang.VerbatimExpr("StructFieldRef"),
+			ctx.glangType(n, info.namedType), glang.StringLiteral{Value: v.Name()}, *expr)
+		*curType = v.Type()
+	}
+}
+
+func (ctx *Ctx) selectorExpr(e *ast.SelectorExpr) glang.Expr {
+	selection := ctx.info.Selections[e]
+	if selection == nil {
+		if _, ok := ctx.info.ObjectOf(e.Sel).(*types.Var); ok {
+			ctx.nope(e, "global variable from external package should be handled by exprAddr")
+		} else if f, ok := ctx.info.ObjectOf(e.Sel).(*types.Func); ok {
+			// package-qualified function
+			typeArgs := ctx.info.Instances[e.Sel].TypeArgs
+			args := glang.ListExpr(ctx.convertTypeArgsToGlang(e, typeArgs))
+			return glang.NewCallExpr(
+				glang.VerbatimExpr("FuncResolve"),
+				ctx.termIdent(ctx.pkgRef(f.Pkg())+"."+f.Name()),
+				args,
+				glang.Tt,
+			)
+		} else {
+			obj := ctx.info.ObjectOf(e.Sel)
+			return ctx.handleImplicitConversion(e,
+				ctx.info.TypeOf(e.Sel),
+				ctx.info.TypeOf(e),
+				ctx.termIdent(ctx.pkgRef(obj.Pkg())+"."+e.Sel.Name),
+			)
+		}
+	}
+
+	switch selection.Kind() {
+	case types.MethodExpr:
+		ctx.unsupported(e, "method expr")
+	case types.FieldVal:
+		var expr glang.Expr
+		index, curType := selection.Index(), selection.Recv()
+
+		if ctx.info.Types[e.X].Addressable() {
+			expr = ctx.exprAddr(e.X)
+		} else {
+			expr = ctx.expr(e.X)
+			ctx.fieldSelection(e.X, &index, &curType, &expr)
+		}
+		if len(index) > 0 {
+			ctx.fieldAddrSelection(e.X, index, &curType, &expr)
+			expr = glang.DerefExpr{X: expr, Ty: ctx.glangType(e.Sel, curType)}
+		}
+		return expr
+
+	case types.MethodVal:
+		// x.M, with M promoted through embedded fields f1...fk, is x.f1...fk.M.
+		// Go evaluates the receiver r = x.f1...fk here and saves it, and calls
+		// of the method value, whenever they run, use the saved copy (Go spec,
+		// "Method values"): for a value-receiver method, a copy of r (of *r if
+		// r is a pointer, dereferenced here); for a pointer-receiver method,
+		// the pointer r, or &r if r is addressable. So the receiver is
+		// evaluated to that value now, and the method resolved on its type.
+		f := selection.Obj().(*types.Func)
+		_, ptrRecv := f.Type().(*types.Signature).Recv().Type().(*types.Pointer)
+		path := selection.Index()[:len(selection.Index())-1]
+		var expr glang.Expr
+		curType := selection.Recv()
+		// haveAddr: expr is r's address (expr : ptr<curType>), else r's value
+		haveAddr := ctx.info.Types[e.X].Addressable()
+		if haveAddr {
+			expr = ctx.exprAddr(e.X)
+		} else {
+			expr = ctx.expr(e.X)
+			ctx.fieldSelection(e.X, &path, &curType, &expr)
+		}
+		if len(path) > 0 {
+			haveAddr = true
+			ctx.fieldAddrSelection(e.X, path, &curType, &expr)
+		}
+		_, rIsPtr := curType.Underlying().(*types.Pointer)
+		// The saved receiver is &r, the case Go writes x.M for (&x).M, ...
+		needAddr := ptrRecv && !rIsPtr
+		if haveAddr && !needAddr {
+			expr = glang.DerefExpr{X: expr, Ty: ctx.glangType(e.X, curType)}
+		} else if !haveAddr && needAddr {
+			ctx.nope(e, "pointer-receiver method value of a non-addressable value")
+		}
+		receiverType := types.Unalias(curType)
+		if needAddr {
+			receiverType = types.NewPointer(receiverType)
+		} else if !ptrRecv && rIsPtr {
+			// ... or *r, the case Go writes p.M for (*p).M
+			receiverType = types.Unalias(curType.Underlying().(*types.Pointer).Elem())
+			expr = glang.DerefExpr{X: expr, Ty: ctx.glangType(e.X, receiverType)}
+		}
+		return glang.NewCallExpr(glang.VerbatimExpr("MethodResolve"),
+			ctx.glangType(e.X, receiverType), glang.StringLiteral{Value: e.Sel.Name}, expr)
+	}
+	panic("unreachable")
+}
+
+type compositeBinding struct {
+	name string
+	val  glang.Expr
+}
+
+func (ctx *Ctx) compositeLiteral(e *ast.CompositeLit) glang.Expr {
+	var bindings []compositeBinding
+	res := ctx.compositeLiteralWithBindings(e, &bindings)
+
+	for i := len(bindings) - 1; i >= 0; i-- {
+		res = glang.LetExpr{
+			Names:   []string{bindings[i].name},
+			ValExpr: bindings[i].val,
+			Cont:    res,
+		}
+	}
+	return res
+}
+
+func (ctx *Ctx) compositeLiteralWithBindings(e *ast.CompositeLit, bindings *[]compositeBinding) glang.Expr {
+	var elements glang.ListExpr
+
+	handleValue := func(ev ast.Expr) glang.Expr {
+		switch ev := ev.(type) {
+		case *ast.CompositeLit:
+			if ev.Type == nil {
+				return ctx.compositeLiteralWithBindings(ev, bindings)
+			}
+		}
+
+		name := fmt.Sprintf("$v%d", len(*bindings))
+		*bindings = append(*bindings, compositeBinding{name: name, val: ctx.expr(ev)})
+		return glang.NewCallExpr(glang.VerbatimExpr("ElementExpression"),
+			ctx.glangType(ev, ctx.typeOf(ev)), glang.IdentExpr(name))
+	}
+
+	// a slice literal whose length would be 2^63 or more (an element at index math.MaxInt,
+	// keyed or not) is miscompiled by gc; the semantics does not model that length
+	if _, ok := underlyingType(ctx.typeOf(e)).(*types.Slice); ok {
+		next := int64(0)
+		for _, el := range e.Elts {
+			if kv, ok := el.(*ast.KeyValueExpr); ok {
+				if tv, ok := ctx.info.Types[kv.Key]; ok && tv.Value != nil {
+					if idx, exact := constant.Int64Val(constant.ToInt(tv.Value)); exact {
+						next = idx
+					}
+				}
+			}
+			if next == math.MaxInt64 {
+				ctx.unsupported(el, "composite literal index math.MaxInt")
+			}
+			next++
+		}
+	}
+
+	for _, el := range e.Elts {
+		var k glang.Expr = glang.VerbatimExpr("None")
+		var v glang.Expr
+
+		switch el := el.(type) {
+		case *ast.KeyValueExpr:
+			done := false
+			if elKey, ok := el.Key.(*ast.Ident); ok {
+				if vr, ok := ctx.info.Uses[elKey].(*types.Var); ok && vr.Kind() == types.FieldVar {
+					k = glang.NewCallExpr(glang.VerbatimExpr("KeyField"),
+						glang.StringLiteral{Value: elKey.Name})
+					done = true
+				}
+			}
+			if !done {
+				// array and slice literal keys are constant indices, which the
+				// semantics expects as KeyInteger
+				switch underlyingType(ctx.typeOf(e)).(type) {
+				case *types.Array, *types.Slice:
+					if tv, ok := ctx.info.Types[el.Key]; ok && tv.Value != nil {
+						if idx, exact := constant.Int64Val(constant.ToInt(tv.Value)); exact {
+							k = glang.NewCallExpr(glang.VerbatimExpr("KeyInteger"), glang.IntToZ(idx))
+							done = true
+						}
+					}
+				}
+			}
+			if !done {
+				name := fmt.Sprintf("$k%d", len(*bindings))
+				*bindings = append(*bindings, compositeBinding{name: name, val: ctx.expr(el.Key)})
+				k = glang.NewCallExpr(glang.VerbatimExpr("KeyExpression"),
+					ctx.glangType(el.Key, ctx.typeOf(el.Key)), glang.IdentExpr(name))
+			}
+			k = glang.NewCallExpr(glang.VerbatimExpr("Some"), k)
+			v = handleValue(el.Value)
+		default:
+			v = handleValue(el)
+		}
+
+		elements = append(elements, glang.NewCallExpr(glang.VerbatimExpr("KeyedElement"), k, v))
+	}
+
+	if e.Type != nil {
+		return glang.NewCallExpr(glang.VerbatimExpr("CompositeLiteral"),
+			ctx.glangType(e.Type, ctx.typeOf(e.Type)),
+			glang.NewCallExpr(glang.VerbatimExpr("LiteralValue"), elements))
+	} else {
+		return glang.NewCallExpr(glang.VerbatimExpr("ElementLiteralValue"), elements)
+	}
+}
+
+func (ctx *Ctx) basicLiteral(e *ast.BasicLit) glang.Expr {
+	return ctx.constantLiteral(e)
+}
+
+func (ctx *Ctx) typeJoin(n ast.Node, t1, t2 types.Type) types.Type {
+	if types.AssignableTo(t1, t2) {
+		return t2
+	} else if types.AssignableTo(t2, t1) {
+		return t1
+	} else {
+		ctx.unsupported(n, "comparison between non-assignable types")
+		return nil
+	}
+}
+
+var shiftOps = map[token.Token]struct{}{
+	token.SHL: {},
+	token.SHR: {},
+}
+
+func (ctx *Ctx) binExpr(e *ast.BinaryExpr) (expr glang.Expr) {
+	// XXX: according to the Go spec, comparisons can occur between types that
+	// are "assignable" to one another. This may require a conversion, so we
+	// here convert to the appropriate type here.
+	//
+	// This also handles converting untyped constants to a typed constant.
+	xT, yT := ctx.typeOf(e.X), ctx.typeOf(e.Y)
+	var compType types.Type
+	if _, ok := shiftOps[e.Op]; ok {
+		// Shifts should be converted to the type of the base; the shift amount and
+		// the base do not need to have a type join (e.g., x << y where x is a uint8
+		// and y is a uint32)
+		compType = xT
+	} else {
+		compType = ctx.typeJoin(e, xT, yT)
+	}
+
+	op := gooseLangOps[e.Op]
+
+	// uintptr(p) - uintptr(q), for unsafe.Pointers p and q whose evaluation cannot move the
+	// stack (stackStable): the distance between two addresses taken at one instant
+	// (go.UnsafeSemantics.ptr_diff), p and q evaluated left to right. Otherwise it is the
+	// difference of two unrelated conversions.
+	if e.Op == token.SUB {
+		if p, ok := ctx.pointerConversionOperand(e.X); ok {
+			if q, ok := ctx.pointerConversionOperand(e.Y); ok &&
+				ctx.stackStable(p) && ctx.stackStable(q) {
+				return bindInOrder([]glang.Expr{ctx.expr(p), ctx.expr(q)}, glang.BinaryExpr{
+					X:  unsafeArg(0),
+					Op: glang.BinOp{OpId: glang.OpMinus, Type: glang.TermIdent("unsafe.Pointer")},
+					Y:  unsafeArg(1),
+				})
+			}
+		}
+	}
+
+	if t, ok := compType.(*types.Basic); ok {
+		switch t.Kind() {
+		case types.UntypedInt, types.UntypedString:
+			return ctx.constantLiteral(e)
+		}
+	}
+	expr = ctx.binOpExpr(e, op, compType,
+		ctx.handleImplicitConversion(e.X, xT, compType, ctx.expr(e.X)), ctx.expr(e.Y), yT)
+
+	// FIXME: might need to do a conversion here. Handle e.g. interface
+	// conversion of (x < 10) as well as conversion of (x + 10).
+	// expr = ctx.handleImplicitConversion(e, compType, ctx.typeOf(e), expr)
+	return expr
+}
+
+// binOpExpr is x op y with x (already translated, of type xT) and y (translated,
+// of type yT).
+func (ctx *Ctx) binOpExpr(n locatable, op glang.OpId, xT types.Type, x, y glang.Expr, yT types.Type) glang.Expr {
+	if op == glang.OpShl || op == glang.OpShr {
+		// The count keeps its own type: the semantics decides what a count of
+		// that type means (sign, width), whatever the type of the shifted
+		// operand.
+		return glang.BinaryExpr{
+			X: x,
+			Op: glang.BinOp{
+				OpId:      op,
+				Type:      ctx.glangType(n, xT),
+				CountType: ctx.glangType(n, yT),
+			},
+			Y: y,
+		}
+	}
+	return glang.BinaryExpr{
+		X:  x,
+		Op: glang.BinOp{OpId: op, Type: ctx.glangType(n, xT)},
+		Y:  ctx.handleImplicitConversion(n, yT, xT, y),
+	}
+}
+
+func (ctx *Ctx) sliceExpr(e *ast.SliceExpr) glang.Expr {
+	xT := ctx.typeOf(e.X)
+	ty := ctx.glangType(e, xT)
+	arrayTy, isArray := underlyingType(xT).(*types.Array)
+	// a pointer to an array: p[i:j] is (*p)[i:j], the slice of the array at p (nil
+	// panics: go.ArraySemantics.slice_array_step)
+	var arrayPtr bool
+	if ptrTy, ok := underlyingType(xT).(*types.Pointer); ok {
+		if arrayTy, arrayPtr = underlyingType(ptrTy.Elem()).(*types.Array); arrayPtr {
+			ty = ctx.glangType(e, ptrTy.Elem())
+		}
+	}
+
+	var lowExpr glang.Expr = glang.Int64Val{Value: glang.IntToZ(0)}
+	var highExpr glang.Expr
+	var x glang.Expr
+	// Go requires an array slice operand to be addressable, so exprAddr is
+	// defined here. The result aliases the array, so a loaded copy would be
+	// wrong. len of an array is its constant length.
+	if isArray {
+		x = ctx.exprAddr(e.X)
+		highExpr = glang.Int64Val{Value: glang.IntToZ(arrayTy.Len())}
+	} else if arrayPtr {
+		x = ctx.expr(e.X)
+		highExpr = glang.Int64Val{Value: glang.IntToZ(arrayTy.Len())}
+	} else {
+		x = ctx.expr(e.X)
+		highExpr = glang.NewCallExpr(
+			glang.VerbatimExpr("FuncResolve"),
+			glang.VerbatimExpr("go.len"), glang.ListExpr{ty}, glang.Tt, glang.IdentExpr("$s"))
+	}
+
+	if e.Low != nil {
+		lowExpr = ctx.expr(e.Low)
+	}
+	if e.High != nil {
+		highExpr = ctx.expr(e.High)
+	}
+	var maxExpr glang.Expr
+	if e.Max != nil {
+		maxExpr = ctx.expr(e.Max)
+	}
+
+	// As for x[i] (indexFirst): gc evaluates the bounds' calls and then reads
+	// x's variables, so when x has no call or receive and a bound has one, the
+	// given bounds are bound first, left to right, and x is read after them.
+	var boundBinds []glang.LetExpr
+	if !ctx.mayAssignVars(e.X) &&
+		(ctx.mayAssignVars(e.Low) || ctx.mayAssignVars(e.High) || ctx.mayAssignVars(e.Max)) {
+		bind := func(b ast.Expr, be *glang.Expr, name string) {
+			if b != nil {
+				boundBinds = append(boundBinds, glang.LetExpr{Names: []string{name}, ValExpr: *be})
+				*be = glang.IdentExpr(name)
+			}
+		}
+		bind(e.Low, &lowExpr, "$lo")
+		bind(e.High, &highExpr, "$hi")
+		bind(e.Max, &maxExpr, "$max")
+	}
+
+	var sl glang.Expr
+	if e.Max != nil {
+		sl = glang.NewCallExpr(glang.VerbatimExpr("FullSlice"), ty,
+			glang.TupleExpr{glang.IdentExpr("$s"), lowExpr, highExpr, maxExpr})
+	} else {
+		sl = glang.NewCallExpr(glang.VerbatimExpr("Slice"), ty,
+			glang.TupleExpr{glang.IdentExpr("$s"), lowExpr, highExpr})
+	}
+	var res glang.Expr = glang.LetExpr{Names: []string{"$s"}, ValExpr: x, Cont: sl}
+	for i := len(boundBinds) - 1; i >= 0; i-- {
+		boundBinds[i].Cont = res
+		res = boundBinds[i]
+	}
+	return res
+}
+
+func (ctx *Ctx) unaryExpr(e *ast.UnaryExpr, multipleBindings bool) glang.Expr {
+	if e.Op == token.NOT {
+		return glang.NotExpr{X: ctx.expr(e.X)}
+	}
+	if e.Op == token.AND {
+		if cl, ok := e.X.(*ast.CompositeLit); ok {
+			// e is &T{...} (a composite literal)
+			sl := ctx.compositeLiteral(cl)
+			return glang.NewCallExpr(glang.VerbatimExpr("GoAlloc"),
+				ctx.glangType(cl.Type, ctx.typeOf(e.X)), sl)
+		}
+		// e is something else
+		return ctx.exprAddr(e.X)
+	}
+	if e.Op == token.ARROW {
+		var expr glang.Expr = glang.NewCallExpr(glang.VerbatimExpr("chan.receive"),
+			ctx.glangType(e, chanElem(ctx.typeOf(e.X))),
+			ctx.expr(e.X))
+		if !multipleBindings {
+			expr = glang.NewCallExpr(glang.VerbatimExpr("Fst"), expr)
+		}
+		return expr
+	}
+	op, ok := gooseLangOps[e.Op]
+	if !ok {
+		ctx.unsupported(e, "unary expression %s", e.Op)
+	}
+	ty := ctx.typeOf(e.X)
+	expr := glang.UnaryExpr{
+		X: ctx.expr(e.X),
+		Op: glang.UnaryOp{
+			OpId: op,
+			Type: ctx.glangType(e.X, ty),
+		},
+	}
+	return ctx.handleImplicitConversion(e, ty, ctx.typeOf(e), expr)
+}
+
+func (ctx *Ctx) function(s *ast.Ident) glang.Expr {
+	if ctx.info.ObjectOf(s).Pkg().Path() != ctx.pkgPath {
+		ctx.nope(s, "expected function ident to refer to local function")
+	}
+	f, ok := ctx.info.ObjectOf(s).(*types.Func)
+	if !ok {
+		ctx.nope(s, "expected to get a types.Func object for function ident")
+	}
+	typeArgs := ctx.info.Instances[s].TypeArgs
+	return glang.NewCallExpr(glang.VerbatimExpr("FuncResolve"),
+		ctx.termIdent(f.Name()),
+		glang.ListExpr(ctx.convertTypeArgsToGlang(s, typeArgs)),
+		glang.Tt,
+	)
+}
+
+func (ctx *Ctx) goBuiltin(e *ast.Ident) bool {
+	s, ok := ctx.info.Uses[e]
+	if !ok {
+		return false
+	}
+	return s.Parent() == types.Universe
+}
+
+// if types.Type is an interface that holds a single type, get that type; these
+// typically show up as constraints in generic functions, e.g. `T ~[]int`
+func getInterfaceSingletonType(t types.Type) (types.Type, bool) {
+	if t, ok := t.Underlying().(*types.Interface); ok {
+		if t.NumEmbeddeds() == 1 {
+			t := t.EmbeddedType(0)
+			if t, ok := t.(*types.Union); ok {
+				if t.Len() == 1 {
+					// singleton union (possibly with term.Tilde() being true)
+					term := t.Term(0)
+					// the single type in the union is unionT
+					unionT := term.Type()
+					return unionT, true
+				}
+			}
+		}
+	}
+	return nil, false
+}
+
+// underlyingType returns the underlying type of t, including if t is of an
+// singleton interface.
+func underlyingType(t types.Type) types.Type {
+	if t, ok := getInterfaceSingletonType(t); ok {
+		return t.Underlying()
+	}
+	return t.Underlying()
+}
+
+func (ctx *Ctx) builtinIdent(e *ast.Ident) glang.Expr {
+	switch e.Name {
+	case "nil":
+		return glang.VerbatimExpr("UntypedNil")
+	case "true":
+		return glang.GooseBoolLiteral(true)
+	case "false":
+		return glang.GooseBoolLiteral(false)
+	case "append", "len", "cap", "copy", "delete", "close", "clear":
+		sig := ctx.typeOf(e).(*types.Signature)
+		ty := ctx.glangType(e, sig.Params().At(0).Type())
+		return glang.NewCallExpr(glang.VerbatimExpr("FuncResolve"),
+			glang.VerbatimExpr("go."+e.Name), glang.ListExpr{ty}, glang.Tt)
+	case "new":
+		ctx.nope(e, "new should be handled elsewhere")
+	case "panic":
+		return glang.NewCallExpr(glang.VerbatimExpr("FuncResolve"),
+			glang.VerbatimExpr("go."+e.Name), glang.ListExpr{}, glang.Tt)
+
+	case "min", "max":
+		sig := ctx.typeOf(e).(*types.Signature)
+		if sig.Params().Len() == 0 {
+			ctx.nope(e, "min/max with no params")
+		}
+		// figure out the desired type by taking a type join of everything.
+		// XXX: the signature might always be (T, T, T, T, T).
+		var t types.Type = sig.Params().At(0).Type().Underlying()
+		for i := 0; i < sig.Params().Len(); i++ {
+			t = ctx.typeJoin(e, t, sig.Params().At(i).Type())
+		}
+		var typeArgs glang.ListExpr
+		ty := ctx.glangType(e, t)
+		for i := 0; i < sig.Params().Len(); i++ {
+			typeArgs = append(typeArgs, ty)
+		}
+
+		return glang.NewCallExpr(glang.VerbatimExpr("FuncResolve"),
+			glang.VerbatimExpr("go."+e.Name), typeArgs, glang.Tt)
+	case "iota":
+		return ctx.constantLiteral(e)
+	case "recover":
+		ctx.nope(e, "recover should be handled elsewhere")
+	default:
+		ctx.unsupported(e, "builtin identifier of type %v", ctx.typeOf(e))
+	}
+	return nil
+}
+
+// untypedFloatToInt converts a constant (assumed to be a float) to an integer.
+//
+// Returns ok = false if the float doesn't fit in an int64.
+func untypedFloatToInt(c constant.Value) (i int64, ok bool) {
+	switch x := constant.Val(c).(type) {
+	case *big.Rat:
+		if x.IsInt() {
+			v, exact := x.Float64()
+			if !exact {
+				return 0, false
+			}
+			return int64(v), true
+		}
+	case *big.Float:
+		if x.IsInt() {
+			var acc big.Accuracy
+			i, acc = x.Int64()
+			if acc != big.Exact {
+				return 0, false
+			}
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+func (ctx *Ctx) identExpr(e *ast.Ident, multipleBindings bool) glang.Expr {
+	// XXX: special case for a manually constructed Ident from select recv clause
+	if len(e.Name) > 0 && e.Name[0] == '$' {
+		var expr glang.Expr = glang.IdentExpr(e.Name)
+		if !multipleBindings {
+			expr = glang.NewCallExpr(glang.VerbatimExpr("Fst"), expr)
+		}
+		return expr
+	}
+
+	if ctx.goBuiltin(e) {
+		return ctx.builtinIdent(e)
+	}
+
+	// check if e refers to a variable,
+	obj := ctx.info.ObjectOf(e)
+	if constObj, ok := obj.(*types.Const); ok {
+		// is a constant
+		if constTy, ok := constObj.Type().(*types.Basic); ok && constTy.Kind() == types.UntypedFloat {
+			dstTy := ctx.typeOf(e)
+			if dstTy, ok := dstTy.(*types.Basic); ok && dstTy.Info()&types.IsInteger != 0 {
+				constInt, exact := untypedFloatToInt(constObj.Val())
+				if !exact {
+					ctx.nope(e, "float constant does not fit into int64")
+				}
+				constExpr := glang.VerbatimExpr(fmt.Sprintf("%d", constInt))
+				switch dstTy.Kind() {
+				case types.Uint64, types.Int64, types.Int:
+					return glang.Int64Val{
+						Value: constExpr,
+					}
+				case types.Uint32, types.Int32:
+					return glang.Int32Val{
+						Value: constExpr,
+					}
+				case types.Uint16, types.Int16:
+					return glang.Int16Val{
+						Value: constExpr,
+					}
+				case types.Uint8, types.Int8:
+					return glang.Int8Val{
+						Value: constExpr,
+					}
+				}
+			}
+		}
+		constE := ctx.termIdent(e.Name)
+		return ctx.handleImplicitConversion(e, constObj.Type(), ctx.typeOf(e), constE)
+	}
+	if _, ok := obj.(*types.Var); ok {
+		ctx.nope(e, "variable references should get translated via exprAddr")
+	}
+	if _, ok := obj.(*types.Func); ok {
+		// is a function
+		return ctx.function(e)
+	}
+	ctx.unsupported(e, "unrecognized kind of identifier; not local variable or global function")
+	panic("")
+}
+
+func (ctx *Ctx) indexExpr(e *ast.IndexExpr, multipleBindings bool) glang.Expr {
+	xTy := ctx.typeOf(e.X).Underlying()
+	switch xTy := xTy.(type) {
+	case *types.Map:
+		if multipleBindings {
+			return glang.NewCallExpr(glang.VerbatimExpr("map.lookup2"),
+				ctx.glangType(e.X, xTy.Key()),
+				ctx.glangType(e.X, xTy.Elem()),
+				ctx.expr(e.X),
+				ctx.exprIntoType(e.Index, xTy.Key()))
+		} else {
+			return glang.NewCallExpr(glang.VerbatimExpr("map.lookup1"),
+				ctx.glangType(e.X, xTy.Key()),
+				ctx.glangType(e.X, xTy.Elem()),
+				ctx.expr(e.X),
+				ctx.exprIntoType(e.Index, xTy.Key()))
+		}
+	case *types.Signature:
+		// generic arguments are grabbed from go ast, ignore explicit type args
+		return ctx.expr(e.X)
+	}
+
+	return ctx.indexFirst(e.X, e.Index, ctx.exprIntoType(e.Index, types.Typ[types.Int]),
+		func(i glang.Expr) glang.Expr {
+			return glang.NewCallExpr(glang.VerbatimExpr("Index"),
+				ctx.glangType(e, ctx.typeOf(e.X)),
+				glang.TupleExpr{ctx.expr(e.X), i})
+		})
+}
+
+// indexFirst builds x[i] (as build applied to i's translation ie) in the order
+// gc evaluates it. The spec ("Order of evaluation") orders only the calls and
+// receives of x and i; gc evaluates i's and then reads x's variables, so when
+// i can assign a variable and x cannot (mayAssignVars), i is bound first and x
+// read after it (`s[f()]` with f changing s indexes the new s, and panics if
+// that is out of range). Otherwise x is translated first, which runs its calls
+// before i's as the spec requires.
+func (ctx *Ctx) indexFirst(x ast.Expr, i ast.Expr, ie glang.Expr, build func(glang.Expr) glang.Expr) glang.Expr {
+	if !ctx.mayAssignVars(x) && ctx.mayAssignVars(i) {
+		return glang.LetExpr{Names: []string{"$idx"}, ValExpr: ie,
+			Cont: build(glang.IdentExpr("$idx"))}
+	}
+	return build(ie)
+}
+
+func (ctx *Ctx) indexListExpr(e *ast.IndexListExpr) glang.Expr {
+	// generic arguments are grabbed from go ast, ignore explicit type args
+	return ctx.expr(e.X)
+}
+
+func (ctx *Ctx) derefExpr(e ast.Expr) glang.Expr {
+	return glang.DerefExpr{
+		X:  ctx.expr(e),
+		Ty: ctx.glangType(e, ptrElem(ctx.typeOf(e))),
+	}
+}
+
+func (ctx *Ctx) expr(e ast.Expr) glang.Expr {
+	if ctx.info.Types[e].Addressable() {
+		return glang.DerefExpr{X: ctx.exprAddr(e), Ty: ctx.glangType(e, ctx.typeOf(e))}
+	} else {
+		return ctx.exprSpecial(e, false)
+	}
+}
+
+func (ctx *Ctx) funcLit(e *ast.FuncLit) glang.FuncLit {
+	fl := glang.FuncLit{}
+
+	// reset to original value after translating this FuncLit
+	defer func(b bool, rs []glang.Expr) {
+		ctx.usesDefer = b
+		ctx.resultTypes = rs
+	}(ctx.usesDefer, ctx.resultTypes)
+	defer func(defaultReturn glang.Expr) {
+		ctx.defaultReturn = defaultReturn
+	}(ctx.defaultReturn)
+
+	defer func(b, ok bool) {
+		ctx.usesRecover = b
+		ctx.recoverOK = ok
+	}(ctx.usesRecover, ctx.recoverOK)
+	ctx.usesRecover = false
+	ctx.recoverOK = ctx.nextFuncLitDeferred
+	ctx.nextFuncLitDeferred = false
+
+	ctx.beginFuncBody(e.Body, e.Type.Results)
+	if ctx.recoverOK && ctx.callsRecoverDirectly(e.Body) && ctx.defersRecover(e.Body) {
+		// the literal's own `with_defer_recover:` would bind a fresh `$panic`,
+		// hiding the cell of the function that deferred it, which its
+		// recover() must read
+		ctx.unsupported(e, "recover() in a deferred function literal that itself "+
+			"defers a function literal calling recover()")
+	}
+
+	defer func(oldFuncType *types.Signature) {
+		ctx.curFuncType = oldFuncType
+	}(ctx.curFuncType)
+
+	ctx.curFuncType = ctx.typeOf(e.Type).(*types.Signature)
+	var argTypes []glang.Expr
+	fl.Args, argTypes = ctx.paramList(e.Type.Params)
+	var cont glang.Expr = nil
+	if e.Type.Results == nil {
+		// explicitly return #() at end of void functions
+		cont = glang.ReturnExpr{Value: glang.Tt}
+	}
+	fl.Body = ctx.blockStmt(e.Body, cont)
+
+	// Create heap-allocated variables for all of the function parameters
+	for i, arg := range fl.Args {
+		// skip anonymous parameters (which can't be used)
+		if arg.Name != "_" && arg.Name != "" {
+			fl.Body = glang.LetExpr{
+				Names: []string{arg.Name},
+				ValExpr: glang.NewCallExpr(
+					glang.VerbatimExpr("GoAlloc"),
+					argTypes[i], glang.IdentExpr(arg.Name)),
+				Cont: fl.Body,
+			}
+		}
+	}
+	fl.Body = ctx.wrapFuncBody(fl.Body, e.Type.Results)
+
+	return fl
+}
+
+func (ctx *Ctx) typeAssertExpr(e *ast.TypeAssertExpr, multipleBindings bool) glang.Expr {
+	ty := ctx.glangType(e, ctx.typeOf(e.Type))
+	if multipleBindings {
+		return glang.NewCallExpr(glang.VerbatimExpr("TypeAssert2"),
+			ty,
+			ctx.expr(e.X),
+		)
+	}
+	return glang.NewCallExpr(glang.VerbatimExpr("TypeAssert"), ty, ctx.expr(e.X))
+}
+
+func (ctx *Ctx) exprSpecial(e ast.Expr, multipleBindings bool) glang.Expr {
+	switch e := e.(type) {
+	case *ast.CallExpr:
+		return ctx.callExpr(e)
+	case *ast.Ident:
+		return ctx.identExpr(e, multipleBindings)
+	case *ast.SelectorExpr:
+		return ctx.selectorExpr(e)
+	case *ast.CompositeLit:
+		return ctx.compositeLiteral(e)
+	case *ast.BasicLit:
+		return ctx.basicLiteral(e)
+	case *ast.BinaryExpr:
+		return ctx.binExpr(e)
+	case *ast.SliceExpr:
+		return ctx.sliceExpr(e)
+	case *ast.IndexExpr:
+		return ctx.indexExpr(e, multipleBindings)
+	case *ast.IndexListExpr:
+		return ctx.indexListExpr(e)
+	case *ast.UnaryExpr:
+		return ctx.unaryExpr(e, multipleBindings)
+	case *ast.ParenExpr:
+		return ctx.expr(e.X)
+	case *ast.StarExpr:
+		return ctx.derefExpr(e.X)
+	case *ast.TypeAssertExpr:
+		return ctx.typeAssertExpr(e, multipleBindings)
+	case *ast.FuncLit:
+		return ctx.funcLit(e)
+	default:
+		ctx.unsupported(e, "unexpected expr")
+	}
+	return nil
+}
+
+func (ctx *Ctx) stmtList(ss []ast.Stmt, cont glang.Expr) glang.Expr {
+	if len(ss) == 0 {
+		if cont == nil {
+			return glang.DoExpr{Expr: glang.Tt}
+		}
+		return cont
+	}
+	var e glang.Expr = nil
+	for len(ss) > 0 {
+		stmt := ss[len(ss)-1]
+		ss = ss[:len(ss)-1]
+		e = ctx.stmt(stmt, e)
+	}
+	return glang.SeqExpr{Expr: e, Cont: cont}
+}
+
+func (ctx *Ctx) blockStmt(s *ast.BlockStmt, cont glang.Expr) glang.Expr {
+	return ctx.stmtList(s.List, cont)
+}
+
+func (ctx *Ctx) switchStmt(s *ast.SwitchStmt, cont glang.Expr) (e glang.Expr) {
+	var tagExpr glang.Expr = glang.GooseBoolLiteral(true)
+
+	var tagType types.Type = types.Typ[types.Bool]
+
+	if s.Tag != nil {
+		tagType = ctx.typeOf(s.Tag)
+		tagExpr = ctx.expr(s.Tag)
+	}
+
+	// The translation of each case body. A body that ends in `fallthrough`
+	// continues with the next body in the source (including the default case).
+	bodies := make([]glang.Expr, len(s.Body.List))
+	for i := len(s.Body.List) - 1; i >= 0; i-- {
+		body := s.Body.List[i].(*ast.CaseClause).Body
+		var cont glang.Expr
+		if n := len(body); n > 0 {
+			if b, ok := body[n-1].(*ast.BranchStmt); ok && b.Tok == token.FALLTHROUGH {
+				body, cont = body[:n-1], bodies[i+1]
+			}
+		}
+		bodies[i] = ctx.stmtList(body, cont)
+	}
+
+	// Get default handler (if it exists)
+	e = glang.DoExpr{Expr: glang.Tt}
+	for i, c := range s.Body.List {
+		if c := c.(*ast.CaseClause); c.List == nil {
+			e = bodies[i]
+		}
+	}
+
+	for i := len(s.Body.List) - 1; i >= 0; i-- {
+		c := s.Body.List[i].(*ast.CaseClause)
+		if c.List == nil {
+			// default case already handled
+			continue
+		}
+
+		getCond := func(i int) glang.Expr {
+			t := ctx.typeOf(c.List[i])
+			eqType := ctx.typeJoin(c.List[i], t, tagType)
+			return glang.BinaryExpr{
+				X: ctx.handleImplicitConversion(c.List[i], tagType, eqType, glang.IdentExpr("$sw")),
+				Op: glang.BinOp{
+					OpId: glang.OpEquals,
+					Type: ctx.glangType(c.List[i], eqType),
+				},
+				Y: ctx.handleImplicitConversion(c.List[i], t, eqType, ctx.expr(c.List[i])),
+			}
+		}
+
+		cond := getCond(0)
+		for i := 1; i < len(c.List); i++ {
+			cond = glang.BinaryExpr{
+				Op: glang.BinOp{
+					OpId: glang.OpLOr,
+					Type: glang.VerbatimExpr("go.bool"),
+				},
+				X: getCond(i), Y: cond}
+		}
+
+		e = glang.IfExpr{
+			Cond: cond,
+			Then: bodies[i],
+			Else: e,
+		}
+	}
+
+	e = glang.LetExpr{Names: []string{"$sw"}, ValExpr: tagExpr, Cont: e}
+
+	if s.Init != nil {
+		e = glang.ParenExpr{Inner: ctx.stmt(s.Init, e)}
+	}
+	if breaksOut(s.Body) {
+		e = glang.CatchBreakExpr{Body: e}
+	}
+
+	e = glang.SeqExpr{Expr: e, Cont: cont}
+	return
+}
+
+func (ctx *Ctx) ifStmt(s *ast.IfStmt, cont glang.Expr) glang.Expr {
+	var elseExpr glang.Expr = glang.DoExpr{Expr: glang.Tt}
+	if s.Else != nil {
+		elseExpr = ctx.stmt(s.Else, nil)
+	}
+	var ife glang.Expr = glang.IfExpr{
+		Cond: ctx.handleImplicitConversion(s.Cond, ctx.typeOf(s.Cond), types.Typ[types.Bool], ctx.expr(s.Cond)),
+		Then: ctx.blockStmt(s.Body, nil),
+		Else: elseExpr,
+	}
+
+	if s.Init != nil {
+		ife = glang.ParenExpr{Inner: ctx.stmt(s.Init, ife)}
+	}
+	return glang.SeqExpr{Expr: ife, Cont: cont}
+}
+
+// loopVarEscapes reports whether a variable v declared by a loop whose
+// condition, body and post statement are nodes may be observed to be a new
+// variable in each iteration (as Go specifies) rather than one variable shared
+// by all iterations: whether nodes capture v in a function literal or take its
+// address, or that of a field or array element of it (with &, by slicing an
+// array, or by selecting a method with a pointer receiver). Otherwise every use
+// of v loads or stores the current iteration's variable, and a shared variable
+// behaves the same.
+func (ctx *Ctx) loopVarEscapes(v types.Object, nodes ...ast.Node) bool {
+	// root is the variable whose storage e is part of: e itself, or a field or
+	// array element of it
+	var root func(e ast.Expr) types.Object
+	root = func(e ast.Expr) types.Object {
+		switch e := e.(type) {
+		case *ast.ParenExpr:
+			return root(e.X)
+		case *ast.Ident:
+			return ctx.info.ObjectOf(e)
+		case *ast.SelectorExpr:
+			if sel := ctx.info.Selections[e]; sel != nil && sel.Kind() == types.FieldVal && !sel.Indirect() {
+				return root(e.X)
+			}
+		case *ast.IndexExpr:
+			if _, ok := ctx.typeOf(e.X).Underlying().(*types.Array); ok {
+				return root(e.X)
+			}
+		}
+		return nil
+	}
+	escapes := false
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		ast.Inspect(n, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.FuncLit:
+				ast.Inspect(n, func(n ast.Node) bool {
+					id, ok := n.(*ast.Ident)
+					escapes = escapes || ok && ctx.info.Uses[id] == v
+					return !escapes
+				})
+				return false
+			case *ast.UnaryExpr:
+				escapes = escapes || n.Op == token.AND && root(n.X) == v
+			case *ast.SliceExpr:
+				_, isArray := ctx.typeOf(n.X).Underlying().(*types.Array)
+				escapes = escapes || isArray && root(n.X) == v
+			case *ast.SelectorExpr:
+				if sel := ctx.info.Selections[n]; sel != nil && sel.Kind() == types.MethodVal {
+					_, ptrRecv := sel.Obj().Type().(*types.Signature).Recv().Type().(*types.Pointer)
+					_, ptrX := ctx.typeOf(n.X).Underlying().(*types.Pointer)
+					escapes = escapes || ptrRecv && !ptrX && root(n.X) == v
+				}
+			}
+			return !escapes
+		})
+	}
+	return escapes
+}
+
+func (ctx *Ctx) forStmt(s *ast.ForStmt, cont glang.Expr) glang.Expr {
+	var cond glang.Expr = glang.GooseBoolLiteral(true)
+	if s.Cond != nil {
+		cond = ctx.expr(s.Cond)
+	}
+	var post glang.Expr = glang.Tt
+	if s.Post != nil {
+		if p, ok := s.Post.(*ast.ExprStmt); ok && ctx.isBuiltinCall(p.X, "panic") {
+			// doFor runs the post statement under `do:`, which would drop the panic
+			ctx.unsupported(s.Post, "panic in a for post statement")
+		}
+		post = ctx.stmt(s.Post, nil)
+	}
+	body := ctx.blockStmt(s.Body, nil)
+
+	// Each iteration has its own copy of each variable x the init statement
+	// declares, which matters only if the loop captures x or takes its address
+	// (loopVarEscapes). Then the cell `$iter_x` holds the address of the
+	// current iteration's copy: the condition and body load it as x, and the
+	// post statement first replaces it by a copy (the Go spec: the next
+	// iteration's variable is declared, with the current value, before the
+	// post statement) and runs with the copy as x.
+	var cells []*ast.Ident
+	if init, ok := s.Init.(*ast.AssignStmt); ok && init.Tok == token.DEFINE {
+		for _, lhs := range init.Lhs {
+			if x := lhs.(*ast.Ident); x.Name != "_" &&
+				ctx.loopVarEscapes(ctx.info.Defs[x], s.Cond, s.Post, s.Body) {
+				cells = append(cells, x)
+			}
+		}
+	}
+	for _, x := range slices.Backward(cells) {
+		t := ctx.glangType(x, ctx.typeOf(x))
+		ptrT := ctx.glangType(x, types.NewPointer(ctx.typeOf(x)))
+		cell := glang.IdentExpr("$iter_" + x.Name)
+		load := glang.DerefExpr{X: cell, Ty: ptrT}
+		cond = glang.LetExpr{Names: []string{x.Name}, ValExpr: load, Cont: cond}
+		body = glang.LetExpr{Names: []string{x.Name}, ValExpr: load, Cont: body}
+		post = glang.LetExpr{Names: []string{x.Name},
+			ValExpr: glang.NewCallExpr(glang.VerbatimExpr("GoAlloc"), t, glang.DerefExpr{X: load, Ty: t}),
+			Cont:    glang.NewDoSeq(glang.StoreStmt{Dst: cell, Ty: ptrT, X: glang.IdentExpr(x.Name)}, post)}
+	}
+	var e glang.Expr = glang.ForLoopExpr{Cond: cond, Post: post, Body: body}
+	for _, x := range slices.Backward(cells) {
+		e = glang.LetExpr{Names: []string{"$iter_" + x.Name},
+			ValExpr: glang.NewCallExpr(glang.VerbatimExpr("GoAlloc"),
+				ctx.glangType(x, types.NewPointer(ctx.typeOf(x))), glang.IdentExpr(x.Name)),
+			Cont: e}
+	}
+	if s.Init != nil {
+		e = glang.ParenExpr{Inner: ctx.stmt(s.Init, e)}
+	}
+	return glang.SeqExpr{Expr: e, Cont: cont}
+}
+
+func (ctx *Ctx) rangeStmt(s *ast.RangeStmt) glang.Expr {
+	// Each iteration has its own iteration variables. A variable the loop
+	// declares is allocated in the body if the body captures it or takes its
+	// address (loopVarEscapes), and otherwise once, before the loop.
+	body := ctx.blockStmt(s.Body, nil)
+	var shared []*ast.Ident
+	for _, kv := range []struct {
+		x ast.Expr
+		v string
+	}{{s.Key, "$key"}, {s.Value, "$value"}} {
+		x, _ := kv.x.(*ast.Ident)
+		switch {
+		case kv.x == nil:
+		case s.Tok == token.DEFINE && x.Name != "_" && ctx.loopVarEscapes(ctx.info.Defs[x], s.Body):
+			body = glang.LetExpr{Names: []string{x.Name},
+				ValExpr: glang.NewCallExpr(glang.VerbatimExpr("GoAlloc"),
+					ctx.glangType(x, ctx.typeOf(x)), glang.IdentExpr(kv.v)),
+				Cont: body}
+		default:
+			if s.Tok == token.DEFINE && x.Name != "_" {
+				shared = append(shared, x)
+			}
+			body = ctx.assignFromTo(kv.x, glang.IdentExpr(kv.v), body)
+		}
+	}
+
+	// Go evaluates the range expression, except when the loop has no value
+	// variable and its length is constant: an array, or pointer to one, with no
+	// calls or receives. Evaluating it could then only panic (`range *p` with
+	// `p` nil), so goose does not either; nor is it read.
+	evalRange := true
+	var e glang.Expr
+	t := ctx.typeOf(s.X).Underlying()
+	ptr, isPtr := t.(*types.Pointer)
+	if isPtr {
+		t = ptr.Elem().Underlying()
+	}
+	switch t := t.(type) {
+	case *types.Map:
+		e = glang.ForRangeMapExpr{
+			KeyType:  ctx.glangType(s.X, t.Key()),
+			ElemType: ctx.glangType(s.X, t.Elem()),
+			Map:      glang.IdentExpr("$range"),
+			Body:     body,
+		}
+	case *types.Slice:
+		e = glang.ForRangeSliceExpr{
+			Slice: glang.IdentExpr("$range"),
+			Ty:    ctx.glangType(s.X, sliceElem(ctx.typeOf(s.X))),
+			Body:  body,
+		}
+	case *types.Chan:
+		e = glang.ForRangeChanExpr{
+			Chan: glang.IdentExpr("$range"),
+			Elem: ctx.glangType(s.X, chanElem(ctx.typeOf(s.X))),
+			Body: body,
+		}
+	case *types.Array:
+		arr := glang.ForRangeArrayExpr{
+			Len:  t.Len(),
+			Elem: ctx.glangType(s.X, t.Elem()),
+			Ptr:  isPtr,
+			Body: body,
+		}
+		if s.Value != nil {
+			arr.Array = glang.IdentExpr("$range")
+		} else {
+			evalRange = false
+			ast.Inspect(s.X, func(n ast.Node) bool {
+				_, isCall := n.(*ast.CallExpr)
+				u, ok := n.(*ast.UnaryExpr)
+				evalRange = evalRange || isCall || ok && u.Op == token.ARROW
+				return !evalRange
+			})
+		}
+		e = arr
+	case *types.Basic:
+		// `for i := range n` (Go 1.22): `n`, of an integer type (an untyped
+		// constant counts as an `int`), is evaluated once (`$range`), and the
+		// iterations bind `$key` to `0`, `1`, ..., `n - 1` (none if `n <= 0`),
+		// counted in a cell `$range_i` of that type: the three-clause loop
+		// `for $range_i := 0; $range_i < $range; $range_i++`.
+		if isPtr || t.Info()&types.IsInteger == 0 {
+			ctx.unsupported(s, "range over %v (only integers, maps, slices, channels and arrays are supported)", t)
+			return nil
+		}
+		nT := ctx.typeOf(s.X)
+		if t.Info()&types.IsUntyped != 0 {
+			nT = types.Typ[types.Int]
+		}
+		ty := ctx.glangType(s.X, nT)
+		var one glang.Expr
+		switch nT.Underlying().(*types.Basic).Kind() {
+		case types.Uint64, types.Int64, types.Int, types.Uint:
+			one = glang.Int64Val{Value: glang.ZLiteral{Value: big.NewInt(1)}}
+		case types.Uint32, types.Int32:
+			one = glang.Int32Val{Value: glang.ZLiteral{Value: big.NewInt(1)}}
+		case types.Uint8, types.Int8:
+			one = glang.Int8Val{Value: glang.ZLiteral{Value: big.NewInt(1)}}
+		default:
+			ctx.unsupported(s, "range over %v", t)
+			return nil
+		}
+		cell := glang.IdentExpr("$range_i")
+		load := glang.DerefExpr{X: cell, Ty: ty}
+		e = glang.LetExpr{
+			Names: []string{"$range_i"},
+			ValExpr: glang.NewCallExpr(glang.VerbatimExpr("GoAlloc"), ty,
+				glang.NewCallExpr(glang.VerbatimExpr("GoZeroVal"), ty, glang.Tt)),
+			Cont: glang.ForLoopExpr{
+				Cond: glang.BinaryExpr{X: load,
+					Op: glang.BinOp{OpId: glang.OpLessThan, Type: ty}, Y: glang.IdentExpr("$range")},
+				Post: glang.NewDoSeq(glang.StoreStmt{Dst: cell, Ty: ty,
+					X: glang.BinaryExpr{X: load, Op: glang.BinOp{OpId: glang.OpPlus, Type: ty}, Y: one}},
+					glang.Tt),
+				Body: glang.LetExpr{Names: []string{"$key"}, ValExpr: load, Cont: body},
+			},
+		}
+		if t.Info()&types.IsUntyped != 0 {
+			// bind `$range` to the constant as an `int`
+			evalRange = false
+			e = glang.LetExpr{Names: []string{"$range"},
+				ValExpr: ctx.handleImplicitConversion(s.X, ctx.typeOf(s.X), nT, ctx.expr(s.X)), Cont: e}
+		}
+	default:
+		ctx.unsupported(s, "range over %v (only integers, maps, slices, channels and arrays are supported)", t)
+		return nil
+	}
+
+	for _, x := range shared {
+		t := ctx.glangType(x, ctx.typeOf(x))
+		e = glang.LetExpr{
+			Names: []string{x.Name},
+			ValExpr: glang.NewCallExpr(glang.VerbatimExpr("GoAlloc"), t,
+				glang.NewCallExpr(glang.VerbatimExpr("GoZeroVal"), t, glang.Tt)),
+			Cont: e,
+		}
+	}
+	if s.Tok == token.DEFINE {
+		e = glang.ParenExpr{Inner: e}
+	}
+	if evalRange {
+		e = glang.LetExpr{
+			Names:   []string{"$range"},
+			ValExpr: ctx.expr(s.X),
+			Cont:    e,
+		}
+	}
+	return e
+}
+
+func (ctx *Ctx) defineStmt(s *ast.AssignStmt, cont glang.Expr) glang.Expr {
+	// Allocate everything that's new in this define stmt after the right-hand
+	// sides are evaluated: Go evaluates them before the new names are in scope, so
+	// in `x := x` the right-hand side reads the outer `x`.
+	return ctx.assignStmtWith(s, func(e glang.Expr) glang.Expr {
+		for _, lhsExpr := range s.Lhs {
+			if ident, ok := lhsExpr.(*ast.Ident); ok {
+				if _, ok := ctx.info.Defs[ident]; ok { // if this identifier is defining something
+					if ident.Name == "_" {
+						continue
+					}
+					t := ctx.glangType(ident, ctx.info.TypeOf(ident))
+					e = glang.LetExpr{
+						Names: []string{ident.Name},
+						ValExpr: glang.NewCallExpr(glang.VerbatimExpr("GoAlloc"), t,
+							glang.NewCallExpr(glang.VerbatimExpr("GoZeroVal"), t, glang.Tt)),
+						Cont: e,
+					}
+				}
+			} else {
+				ctx.nope(lhsExpr, "defining a non-identifier")
+			}
+		}
+		return e
+	}, cont)
+}
+
+func (ctx *Ctx) varSpec(s *ast.ValueSpec, cont glang.Expr) glang.Expr {
+	var lhs []ast.Expr
+	for _, l := range s.Names {
+		lhs = append(lhs, l)
+	}
+	return ctx.defineStmt(&ast.AssignStmt{Lhs: lhs, Rhs: s.Values}, cont)
+}
+
+// varDeclStmt translates declarations within functions
+func (ctx *Ctx) varDeclStmt(s *ast.DeclStmt, cont glang.Expr) glang.Expr {
+	decl, ok := s.Decl.(*ast.GenDecl)
+	if !ok {
+		ctx.noExample(s, "declaration that is not a GenDecl")
+	}
+	if decl.Tok == token.TYPE {
+		// translated with the package-level types (see Ctx.decl)
+		if cont == nil {
+			return glang.DoExpr{Expr: glang.Tt}
+		}
+		return cont
+	}
+	if decl.Tok == token.CONST {
+		var expr glang.Expr = cont
+		for _, spec := range slices.Backward(decl.Specs) {
+			expr = ctx.functionConstSpec(spec.(*ast.ValueSpec), expr)
+		}
+		return expr
+	}
+	if decl.Tok == token.VAR {
+		var expr glang.Expr = cont
+		// TODO: shouldn't this range be reversed?
+		for _, spec := range decl.Specs {
+			// guaranteed to be a *Ast.ValueSpec due to decl.Tok
+			//
+			// https://golang.org/pkg/go/ast/#GenDecl
+			// TODO: handle TypeSpec
+			expr = ctx.varSpec(spec.(*ast.ValueSpec), expr)
+		}
+		return expr
+	}
+	ctx.nope(s, "declaration %v within a function (not a type, const, or var)", decl.Tok)
+	return nil
+}
+
+func (ctx *Ctx) getIndexType(n locatable, t types.Type) types.Type {
+	switch t := t.Underlying().(type) {
+	case *types.Slice:
+		return types.Typ[types.Int]
+	case *types.Map:
+		return t.Key()
+	case *types.Array:
+		return types.Typ[types.Int]
+	}
+	ctx.unsupported(n, "unexpected type for indexing")
+	return nil
+}
+
+// Returns the address of the given expression.
+// Requires that e is actually addressable
+func (ctx *Ctx) exprAddr(e ast.Expr) glang.Expr {
+	switch e := e.(type) {
+	case *ast.ParenExpr:
+		return ctx.exprAddr(e.X)
+	case *ast.Ident:
+		obj := ctx.info.ObjectOf(e)
+		if _, ok := obj.(*types.Var); ok {
+			if obj.Pkg().Scope() == obj.Parent() {
+				return glang.NewCallExpr(glang.VerbatimExpr("GlobalVarAddr"),
+					ctx.termIdent(e.Name),
+					glang.Tt,
+				)
+			} else {
+				return glang.IdentExpr(e.Name)
+			}
+		} else {
+			ctx.unsupported(e, "exprAddr of ident that is not a var")
+		}
+	case *ast.IndexExpr:
+		targetTy := ctx.typeOf(e.X)
+		// IndexRef of a slice takes the slice value, of an array the
+		// array's address
+		var target glang.Expr
+		switch t := underlyingType(targetTy).(type) {
+		case *types.Array:
+			target = ctx.exprAddr(e.X)
+		case *types.Pointer:
+			// p[i] for p a pointer to an array indexes *p
+			if _, ok := underlyingType(t.Elem()).(*types.Array); ok {
+				targetTy = t.Elem()
+			}
+			target = ctx.expr(e.X)
+		default:
+			target = ctx.expr(e.X)
+		}
+		return ctx.indexFirst(e.X, e.Index,
+			ctx.exprIntoType(e.Index, ctx.getIndexType(e.Index, targetTy)),
+			func(i glang.Expr) glang.Expr {
+				return glang.NewCallExpr(glang.VerbatimExpr("IndexRef"),
+					ctx.glangType(e, targetTy), glang.TupleExpr{target, i})
+			})
+	case *ast.StarExpr:
+		return ctx.expr(e.X)
+	case *ast.SelectorExpr:
+		return ctx.selectorExprAddr(e)
+	default:
+		ctx.unsupported(e, "address of unknown expression")
+	}
+	return nil
+}
+
+func (ctx *Ctx) exprIntoType(e ast.Expr, target types.Type) glang.Expr {
+	return ctx.handleImplicitConversion(e, ctx.typeOf(e), target, ctx.expr(e))
+}
+
+func (ctx *Ctx) assignFromTo(lhs ast.Expr, rhs glang.Expr, cont glang.Expr) glang.Expr {
+	// lhs should either be a map index expression, or is addressable
+	switch lhs := lhs.(type) {
+	case *ast.Ident:
+		if lhs.Name == "_" {
+			return glang.NewDoSeq(rhs, cont)
+		}
+	case *ast.IndexExpr:
+		targetTy := ctx.typeOf(lhs.X)
+		switch t := targetTy.Underlying().(type) {
+		case *types.Map:
+			return glang.NewDoSeq(glang.NewCallExpr(glang.VerbatimExpr("map.insert"),
+				ctx.glangType(lhs.Index, t.Key()),
+				ctx.expr(lhs.X),
+				ctx.exprIntoType(lhs.Index, t.Key()),
+				rhs), cont)
+		}
+	}
+
+	return glang.NewDoSeq(glang.StoreStmt{
+		Dst: ctx.exprAddr(lhs),
+		X:   rhs,
+		Ty:  ctx.glangType(lhs, ctx.typeOf(lhs)),
+	}, cont)
+}
+
+// This handles conversions arising from the notion of "assignability" in the Go spec.
+func (ctx *Ctx) handleImplicitConversion(n locatable, from, to types.Type, e glang.Expr) glang.Expr {
+	if to == nil {
+		// This happens when the LHS is `_`
+		return e
+	}
+	if from == nil {
+		ctx.unsupported(n, "implicit conversion: don't know from type")
+	}
+	if types.Identical(from.Underlying(), to.Underlying()) {
+		return e
+	} else {
+		return glang.NewCallExpr(glang.VerbatimExpr("Convert"),
+			ctx.glangType(n, from), ctx.glangType(n, to), e)
+	}
+}
+
+func (ctx *Ctx) assignStmt(s *ast.AssignStmt, cont glang.Expr) glang.Expr {
+	return ctx.assignStmtWith(s, func(e glang.Expr) glang.Expr { return e }, cont)
+}
+
+// assignStmtWith is assignStmt with scope wrapped around the assignments, after
+// the right-hand sides are evaluated; see defineStmt.
+func (ctx *Ctx) assignStmtWith(s *ast.AssignStmt, scope func(glang.Expr) glang.Expr, cont glang.Expr) glang.Expr {
+	e := cont
+	if len(s.Rhs) == 0 {
+		return scope(e)
+	}
+
+	// Execute assignments left-to-right. With several left-hand sides, Go
+	// evaluates their index and indirection operands before any assignment
+	// (the targets are bound to $l<i>, or $lm<i> and $lk<i> for a map, below).
+	multi := len(s.Lhs) > 1
+	var lhsLets []glang.LetExpr
+	for i := len(s.Lhs); i > 0; i-- {
+		lhs, rhs := s.Lhs[i-1], glang.IdentExpr(fmt.Sprintf("$r%d", i-1))
+		ix, isIx := ast.Unparen(lhs).(*ast.IndexExpr)
+		var mapTy *types.Map
+		if isIx {
+			mapTy, _ = ctx.typeOf(ix.X).Underlying().(*types.Map)
+		}
+		if _, ok := lhs.(*ast.Ident); ok || !multi {
+			e = ctx.assignFromTo(lhs, rhs, e)
+		} else if mapTy != nil {
+			m, k := fmt.Sprintf("$lm%d", i-1), fmt.Sprintf("$lk%d", i-1)
+			lhsLets = append(lhsLets,
+				glang.LetExpr{Names: []string{k}, ValExpr: ctx.exprIntoType(ix.Index, mapTy.Key())},
+				glang.LetExpr{Names: []string{m}, ValExpr: ctx.expr(ix.X)})
+			e = glang.NewDoSeq(glang.NewCallExpr(glang.VerbatimExpr("map.insert"),
+				ctx.glangType(ix.Index, mapTy.Key()), glang.IdentExpr(m), glang.IdentExpr(k), rhs), e)
+		} else {
+			l := fmt.Sprintf("$l%d", i-1)
+			lhsLets = append(lhsLets, glang.LetExpr{Names: []string{l}, ValExpr: ctx.exprAddr(lhs)})
+			e = glang.NewDoSeq(glang.StoreStmt{
+				Dst: glang.IdentExpr(l), X: rhs, Ty: ctx.glangType(lhs, ctx.typeOf(lhs)),
+			}, e)
+		}
+	}
+	e = scope(e)
+
+	// Determine RHS types, specially handling multiple returns from a function call.
+	var rhsTypes []types.Type
+	for i := 0; i < len(s.Rhs); i++ {
+		t := ctx.typeOf(s.Rhs[i])
+		if tuple, ok := t.(*types.Tuple); ok {
+			for i := range tuple.Len() {
+				rhsTypes = append(rhsTypes, tuple.At(i).Type())
+			}
+		} else {
+			rhsTypes = append(rhsTypes, t)
+		}
+	}
+
+	// collect the RHS expressions
+	var rhsExprs []glang.Expr
+	if len(s.Rhs) == len(s.Lhs) {
+		for _, rhs := range s.Rhs {
+			rhsExprs = append(rhsExprs, ctx.expr(rhs))
+		}
+	} else {
+		// RHS is a function call returning multiple things. Will introduce
+		// extra let bindings to destructure those multiple returns.
+		for i := range s.Lhs {
+			rhsExprs = append(rhsExprs, glang.IdentExpr(fmt.Sprintf("$ret%d", i)))
+		}
+	}
+
+	// Let bindings for RHSs including conversions
+	for i := len(s.Lhs); i > 0; i-- {
+		e = glang.LetExpr{
+			Names: []string{fmt.Sprintf("$r%d", i-1)},
+			ValExpr: ctx.handleImplicitConversion(s.Lhs[i-1], rhsTypes[i-1],
+				ctx.typeOf(s.Lhs[i-1]), rhsExprs[i-1]),
+			Cont: e,
+		}
+	}
+
+	// Extra let bindings in case RHS is a multiple-returning function
+	if len(s.Rhs) != len(s.Lhs) && len(s.Lhs) > 0 {
+		var n []string
+		for i := range s.Lhs {
+			n = append(n, fmt.Sprintf("$ret%d", i))
+		}
+		e = glang.LetExpr{
+			Names:   n,
+			ValExpr: ctx.exprSpecial(s.Rhs[0], true),
+			Cont:    e,
+		}
+	}
+
+	// the left-hand operands are evaluated first, in order ($l0 outermost)
+	for _, l := range lhsLets {
+		l.Cont = e
+		e = l
+	}
+	return e
+}
+
+func (ctx *Ctx) assignOpStmt(s *ast.AssignStmt, cont glang.Expr) glang.Expr {
+	// map the assign version to the binary operator
+	assignOps := map[token.Token]token.Token{
+		token.ADD_ASSIGN: token.ADD,
+		token.SUB_ASSIGN: token.SUB,
+		token.MUL_ASSIGN: token.MUL,
+		token.QUO_ASSIGN: token.QUO,
+		token.REM_ASSIGN: token.REM,
+
+		token.AND_ASSIGN:     token.AND,
+		token.AND_NOT_ASSIGN: token.AND_NOT,
+		token.OR_ASSIGN:      token.OR,
+		token.XOR_ASSIGN:     token.XOR,
+		token.SHL_ASSIGN:     token.SHL,
+		token.SHR_ASSIGN:     token.SHR,
+	}
+	op, ok := assignOps[s.Tok]
+	if !ok {
+		ctx.unsupported(s, "unsupported assign+update operation %v", s.Tok)
+	}
+	return ctx.updateStmt(s.Lhs[0], gooseLangOps[op], ctx.expr(s.Rhs[0]), ctx.typeOf(s.Rhs[0]),
+		ctx.info.Types[s.Rhs[0]].Value != nil, cont)
+}
+
+// incDecStmt translates x++ and x--, which are x += 1 and x -= 1 with an
+// untyped constant 1 (spec, "IncDec statements"): the 1 is a constant of x's
+// type, or for a type parameter the untyped 1, converted by the semantics.
+func (ctx *Ctx) incDecStmt(stmt *ast.IncDecStmt, cont glang.Expr) glang.Expr {
+	op := glang.OpPlus
+	if stmt.Tok == token.DEC {
+		op = glang.OpMinus
+	}
+	xT := ctx.typeOf(stmt.X)
+	if _, ok := xT.Underlying().(*types.Basic); ok {
+		return ctx.updateStmt(stmt.X, op, ctx.constantValue(stmt, constant.MakeInt64(1), xT), xT, true, cont)
+	}
+	one := glang.ToVal{Value: glang.ZLiteral{Value: big.NewInt(1)}}
+	return ctx.updateStmt(stmt.X, op, one, types.Typ[types.UntypedInt], true, cont)
+}
+
+// updateStmt translates x op= y. Go evaluates the operands of x's index
+// expression or pointer indirection once, together with y, and only then reads
+// x (spec, "Assignment statements"), so the target (an address, or a map and a
+// key) and y are bound before x is read and written back. The spec orders only
+// the calls and receives among those operands; gc reads the variables after
+// evaluating y, so when x's operands have no call or receive, y is bound first,
+// as for x = y. Otherwise the target is bound first, which runs its calls before
+// y's as the spec requires (its variable reads then also happen before y, an
+// order the spec allows). A variable's address and a constant y (yConst) are
+// not bound: evaluating them is pure.
+func (ctx *Ctx) updateStmt(lhs ast.Expr, op glang.OpId, y glang.Expr, yT types.Type,
+	yConst bool, cont glang.Expr) glang.Expr {
+	xT := ctx.typeOf(lhs)
+	ty := ctx.glangType(lhs, xT)
+	var yv glang.Expr = glang.IdentExpr("$opy")
+	if yConst {
+		yv = y
+	}
+	var binds []glang.LetExpr
+	var update glang.Expr
+	if ix, ok := ast.Unparen(lhs).(*ast.IndexExpr); ok {
+		if mapTy, ok := ctx.typeOf(ix.X).Underlying().(*types.Map); ok {
+			kTy := ctx.glangType(ix.Index, mapTy.Key())
+			m, k := glang.IdentExpr("$opm"), glang.IdentExpr("$opk")
+			binds = []glang.LetExpr{
+				{Names: []string{"$opm"}, ValExpr: ctx.expr(ix.X)},
+				{Names: []string{"$opk"}, ValExpr: ctx.exprIntoType(ix.Index, mapTy.Key())},
+			}
+			read := glang.NewCallExpr(glang.VerbatimExpr("map.lookup1"), kTy, ty, m, k)
+			update = glang.NewCallExpr(glang.VerbatimExpr("map.insert"), kTy, m, k,
+				ctx.binOpExpr(lhs, op, xT, read, yv, yT))
+		}
+	}
+	if update == nil {
+		var a glang.Expr = glang.IdentExpr("$opa")
+		if _, ok := ast.Unparen(lhs).(*ast.Ident); ok {
+			a = ctx.exprAddr(lhs)
+		} else {
+			binds = []glang.LetExpr{{Names: []string{"$opa"}, ValExpr: ctx.exprAddr(lhs)}}
+		}
+		update = glang.StoreStmt{
+			Dst: a,
+			X:   ctx.binOpExpr(lhs, op, xT, glang.DerefExpr{X: a, Ty: ty}, yv, yT),
+			Ty:  ty,
+		}
+	}
+	if !yConst {
+		yBind := glang.LetExpr{Names: []string{"$opy"}, ValExpr: y}
+		if hasCallOrRecv(lhs) {
+			binds = append(binds, yBind)
+		} else {
+			binds = append([]glang.LetExpr{yBind}, binds...)
+		}
+	}
+	var e glang.Expr = update
+	for i := len(binds) - 1; i >= 0; i-- {
+		binds[i].Cont = e
+		e = binds[i]
+	}
+	return glang.NewDoSeq(e, cont)
+}
+
+// mayAssignVars reports whether evaluating e can assign a variable: whether it
+// contains a call of a function or method or a receive (a builtin or a
+// conversion assigns none). It is false for an absent (nil) e.
+func (ctx *Ctx) mayAssignVars(e ast.Expr) bool {
+	if e == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(e, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.CallExpr:
+			if !ctx.isConversionOrBuiltin(n) {
+				found = true
+			}
+		case *ast.UnaryExpr:
+			if n.Op == token.ARROW {
+				found = true
+			}
+		case *ast.FuncLit:
+			return false
+		}
+		return !found
+	})
+	return found
+}
+
+// isConversionOrBuiltin reports whether call is a conversion T(x) or a call of
+// a builtin.
+func (ctx *Ctx) isConversionOrBuiltin(call *ast.CallExpr) bool {
+	fun := ast.Unparen(call.Fun)
+	if tv := ctx.info.Types[fun]; tv.IsType() || tv.IsBuiltin() {
+		return true
+	}
+	var id *ast.Ident
+	switch f := fun.(type) {
+	case *ast.Ident:
+		id = f
+	case *ast.SelectorExpr:
+		id = f.Sel
+	case *ast.ArrayType, *ast.MapType, *ast.ChanType, *ast.FuncType,
+		*ast.InterfaceType, *ast.StructType:
+		// a type literal ([]byte(s)): a conversion ((*T)(p) is told from
+		// (*f)() by Types above)
+		return true
+	}
+	if id == nil {
+		return false
+	}
+	switch ctx.info.Uses[id].(type) {
+	case *types.TypeName, *types.Builtin:
+		return true
+	}
+	return false
+}
+
+// hasCallOrRecv reports whether e contains a call (or conversion) or a
+// receive, whose evaluation order the spec fixes.
+func hasCallOrRecv(e ast.Expr) bool {
+	found := false
+	ast.Inspect(e, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.CallExpr:
+			found = true
+		case *ast.UnaryExpr:
+			if n.Op == token.ARROW {
+				found = true
+			}
+		case *ast.FuncLit:
+			return false
+		}
+		return !found
+	})
+	return found
+}
+
+func (ctx *Ctx) branchStmt(s *ast.BranchStmt, cont glang.Expr) glang.Expr {
+	if s.Tok == token.CONTINUE {
+		return glang.SeqExpr{Expr: glang.ContinueExpr{}, Cont: cont}
+	}
+	if s.Tok == token.BREAK {
+		return glang.SeqExpr{Expr: glang.BreakExpr{}, Cont: cont}
+	}
+	ctx.noExample(s, "unexpected control flow %v in loop", s.Tok)
+	return nil
+}
+
+// breaksOut reports whether the body of a switch, type switch or select
+// statement has a `break` that ends that statement (one not inside a nested
+// loop, switch, select or function literal).
+func breaksOut(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.ForStmt, *ast.RangeStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt,
+			*ast.SelectStmt, *ast.FuncLit:
+			return false
+		case *ast.BranchStmt:
+			if n.Tok == token.BREAK && n.Label == nil {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+func (ctx *Ctx) goStmt(e *ast.GoStmt, cont glang.Expr) glang.Expr {
+	if ctx.isBuiltinCall(e.Call, "panic") {
+		// the goroutine's value is dropped, so the panic would be lost
+		ctx.unsupported(e, "go of panic")
+	}
+	args := make([]glang.Expr, 0, len(e.Call.Args))
+	for i := range len(e.Call.Args) {
+		args = append(args, glang.IdentExpr(fmt.Sprintf("$a%d", i)))
+	}
+	var expr glang.Expr = glang.NewDoSeq(glang.SpawnExpr{Body: glang.NewCallExpr(
+		glang.IdentExpr("$go"),
+		args...,
+	)}, cont)
+
+	expr = glang.LetExpr{
+		Names:   []string{"$go"},
+		ValExpr: ctx.expr(e.Call.Fun),
+		Cont:    expr,
+	}
+
+	expr = ctx.callExprPrelude(e.Call, expr)
+
+	return expr
+}
+
+// isBuiltinCall reports whether e is a call of the builtin function name,
+// possibly parenthesized (`(panic(v))` is a valid expression statement).
+func (ctx *Ctx) isBuiltinCall(e ast.Expr, name string) bool {
+	call, ok := ast.Unparen(e).(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	id, ok := call.Fun.(*ast.Ident)
+	return ok && id.Name == name && ctx.info.Types[call.Fun].IsBuiltin()
+}
+
+// callsRecoverDirectly reports whether body calls the builtin recover() outside
+// any nested function literal.
+func (ctx *Ctx) callsRecoverDirectly(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.CallExpr:
+			if id, ok := n.Fun.(*ast.Ident); ok && id.Name == "recover" &&
+				ctx.info.Types[n.Fun].IsBuiltin() {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// defersRecover reports whether body defers (outside any nested function
+// literal) a function literal that calls recover() directly.
+func (ctx *Ctx) defersRecover(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.DeferStmt:
+			if fl, ok := n.Call.Fun.(*ast.FuncLit); ok && ctx.callsRecoverDirectly(fl.Body) {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// defersDirectly reports whether body has a defer statement outside any nested
+// function literal.
+func defersDirectly(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.DeferStmt:
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
+// beginFuncBody sets up the translation of a function body with results
+// `results`: usesDefer, resultTypes and defaultReturn (what a bare `return`
+// is). In a function that defers a bare `return` is `return: #()`, since the
+// function returns the values of its result cells after its deferred calls.
+func (ctx *Ctx) beginFuncBody(body *ast.BlockStmt, results *ast.FieldList) {
+	ctx.usesDefer = defersDirectly(body)
+	ctx.resultTypes = nil
+	var defaultRetExpr glang.TupleExpr
+	if results != nil {
+		for _, r := range results.List {
+			t := ctx.glangType(r.Type, ctx.typeOf(r.Type))
+			if r.Names == nil {
+				ctx.resultTypes = append(ctx.resultTypes, t)
+			}
+			for _, name := range r.Names {
+				ctx.resultTypes = append(ctx.resultTypes, t)
+				defaultRetExpr = append(defaultRetExpr, ctx.namedResultValue(name, r.Type))
+			}
+		}
+	}
+	if len(ctx.resultTypes) == 0 || ctx.usesDefer {
+		defaultRetExpr = glang.TupleExpr{glang.Tt}
+	}
+	ctx.defaultReturn = glang.ReturnExpr{Value: defaultRetExpr}
+}
+
+// resultCell is the name of the cell holding result i in a function that
+// defers.
+func resultCell(i int) string {
+	return fmt.Sprintf("$res%d", i)
+}
+
+// wrapFuncBody wraps the body of a function (with its parameters' allocations)
+// with the allocations of its named results and with `with_defer:` (if it
+// defers), `with_defer_recover:` (if a deferred function literal calls
+// recover()) or `exception_do`. A function that defers also binds the cells
+// `$res<i>` of its results (a named result's variable, or a fresh cell),
+// outside the `with_defer:`, whose first argument reads them: the function's
+// results after its deferred calls have run.
+func (ctx *Ctx) wrapFuncBody(body glang.Expr, results *ast.FieldList) glang.Expr {
+	allocResults := func(body glang.Expr) glang.Expr {
+		if results != nil {
+			for _, r := range results.List {
+				t := ctx.glangType(r.Type, ctx.typeOf(r.Type))
+				for _, name := range r.Names {
+					body = glang.LetExpr{
+						Names: []string{name.Name},
+						ValExpr: glang.NewCallExpr(glang.VerbatimExpr("GoAlloc"), t,
+							glang.NewCallExpr(glang.VerbatimExpr("GoZeroVal"), t, glang.Tt)),
+						Cont: body,
+					}
+				}
+			}
+		}
+		return body
+	}
+	if !ctx.usesDefer {
+		return glang.NewCallExpr(glang.VerbatimExpr("exception_do"), allocResults(body))
+	}
+	var res glang.TupleExpr
+	for i, t := range ctx.resultTypes {
+		res = append(res, glang.DerefExpr{X: glang.IdentExpr(resultCell(i)), Ty: t})
+	}
+	if len(res) == 0 {
+		res = glang.TupleExpr{glang.Tt}
+	}
+	head := "with_defer:"
+	if ctx.usesRecover {
+		head = "with_defer_recover:"
+	}
+	body = glang.NewCallExpr(glang.VerbatimExpr(head), res, body)
+	// bind the result cells, innermost last
+	var cells []glang.LetExpr
+	i := 0
+	if results != nil {
+		for _, r := range results.List {
+			t := ctx.glangType(r.Type, ctx.typeOf(r.Type))
+			fresh := glang.NewCallExpr(glang.VerbatimExpr("GoAlloc"), t,
+				glang.NewCallExpr(glang.VerbatimExpr("GoZeroVal"), t, glang.Tt))
+			if r.Names == nil {
+				cells = append(cells, glang.LetExpr{Names: []string{resultCell(i)}, ValExpr: fresh})
+				i++
+			}
+			for _, name := range r.Names {
+				var v glang.Expr = glang.IdentExpr(name.Name)
+				if name.Name == "_" {
+					v = fresh
+				}
+				cells = append(cells, glang.LetExpr{Names: []string{resultCell(i)}, ValExpr: v})
+				i++
+			}
+		}
+	}
+	for j := len(cells) - 1; j >= 0; j-- {
+		cells[j].Cont = body
+		body = cells[j]
+	}
+	return allocResults(body)
+}
+
+// namedResultValue is the value of the named result `name` (of type `ty`) on a
+// bare `return`: the contents of its local variable, or the zero value for a
+// blank result `_`, which has no variable (the binding of `_` is anonymous, and
+// there may be several of them).
+func (ctx *Ctx) namedResultValue(name *ast.Ident, ty ast.Expr) glang.Expr {
+	t := ctx.glangType(ty, ctx.typeOf(ty))
+	if name.Name == "_" {
+		return glang.NewCallExpr(glang.VerbatimExpr("GoZeroVal"), t, glang.Tt)
+	}
+	return glang.DerefExpr{X: glang.IdentExpr(name.Name), Ty: t}
+}
+
+func (ctx *Ctx) returnStmt(s *ast.ReturnStmt, cont glang.Expr) glang.Expr {
+	if len(s.Results) == 0 {
+		return ctx.defaultReturn
+	}
+
+	exprs := make([]glang.Expr, 0, len(s.Results))
+	var expectedReturnTypes []types.Type
+	if ctx.curFuncType.Results() != nil {
+		for i := range ctx.curFuncType.Results().Len() {
+			expectedReturnTypes = append(expectedReturnTypes, ctx.curFuncType.Results().At(i).Type())
+		}
+	}
+
+	var retExpr glang.Expr
+	func() {
+		var unconvertedReturnValues []exprWithInfo
+		if len(s.Results) == 1 && len(expectedReturnTypes) > 1 {
+			// special case
+			tupleType, ok := ctx.typeOf(s.Results[0]).(*types.Tuple)
+			if !ok {
+				ctx.nope(s.Results[0], "the only way for the number of values in a returnStmt to mismatch "+
+					"the function's signature is passing through a multiple-returning function")
+			}
+			for i := range tupleType.Len() {
+				unconvertedReturnValues = append(unconvertedReturnValues, exprWithInfo{
+					e: glang.IdentExpr(fmt.Sprintf("$ret%d", i)),
+					t: tupleType.At(i).Type(),
+					n: s.Results[0],
+				})
+			}
+			defer func() {
+				var names []string
+				for i := range tupleType.Len() {
+					names = append(names, fmt.Sprintf("$ret%d", i))
+				}
+				retExpr = glang.LetExpr{Names: names,
+					ValExpr: glang.ParenExpr{Inner: ctx.expr(s.Results[0])},
+					Cont:    retExpr,
+				}
+			}()
+		} else {
+			for _, result := range s.Results {
+				unconvertedReturnValues = append(unconvertedReturnValues, exprWithInfo{
+					e: ctx.expr(result),
+					t: ctx.typeOf(result),
+					n: result,
+				})
+			}
+		}
+
+		if len(unconvertedReturnValues) != len(expectedReturnTypes) {
+			log.Print(len(unconvertedReturnValues), len(expectedReturnTypes))
+			log.Print(ctx.curFuncType.Results())
+			ctx.nope(s, "bug")
+		}
+
+		for i, e := range unconvertedReturnValues {
+			exprs = append(exprs, ctx.handleImplicitConversion(e.n, e.t, expectedReturnTypes[i], e.e))
+		}
+		if len(exprs) == 0 { // return #()
+			exprs = []glang.Expr{glang.Tt}
+		}
+		retExpr = glang.ReturnExpr{Value: glang.TupleExpr(exprs)}
+		if ctx.usesDefer {
+			// evaluate the results, assign them to the result cells, and return:
+			// the function returns the cells' values after its deferred calls
+			var names []string
+			for i := range exprs {
+				names = append(names, fmt.Sprintf("$rv%d", i))
+			}
+			var assign glang.Expr = glang.ReturnExpr{Value: glang.Tt}
+			for i := len(exprs) - 1; i >= 0; i-- {
+				assign = glang.LetExpr{
+					ValExpr: glang.StoreStmt{Dst: glang.IdentExpr(resultCell(i)),
+						Ty: ctx.resultTypes[i], X: glang.IdentExpr(names[i])},
+					Cont: assign,
+				}
+			}
+			retExpr = glang.LetExpr{Names: names, ValExpr: glang.TupleExpr(exprs), Cont: assign}
+		}
+	}()
+
+	return glang.SeqExpr{Expr: retExpr, Cont: cont}
+}
+
+func (ctx *Ctx) deferStmt(s *ast.DeferStmt, cont glang.Expr) (expr glang.Expr) {
+	if ctx.isBuiltinCall(s.Call, "panic") {
+		// the deferred chain drops the outcome of a deferred call, so the panic
+		// would be lost (a `panic` statement in a deferred function literal is
+		// translated, and is stuck at the end of the literal)
+		ctx.unsupported(s, "defer of panic")
+	}
+	if !ctx.usesDefer {
+		ctx.nope(s, "defer statement missed by defersDirectly")
+	}
+	args := make([]glang.Expr, 0, len(s.Call.Args))
+	for i := range len(s.Call.Args) {
+		args = append(args, glang.IdentExpr(fmt.Sprintf("$a%d", i)))
+	}
+
+	expr = glang.LetExpr{
+		ValExpr: glang.NewCallExpr(glang.IdentExpr("$f"), args...),
+		Cont:    glang.NewCallExpr(glang.IdentExpr("$oldf"), glang.Tt),
+	}
+
+	expr = glang.FuncLit{Body: expr}
+
+	expr = glang.LetExpr{
+		Names:   []string{"$oldf"},
+		ValExpr: glang.DerefExpr{X: glang.IdentExpr("$defer"), Ty: glang.VerbatimExpr("deferType")},
+		Cont:    expr,
+	}
+
+	expr = glang.StoreStmt{
+		Dst: glang.IdentExpr("$defer"),
+		Ty:  glang.VerbatimExpr("deferType"),
+		X:   expr,
+	}
+
+	var fun glang.Expr
+	if fl, ok := s.Call.Fun.(*ast.FuncLit); ok {
+		if ctx.callsRecoverDirectly(fl.Body) {
+			ctx.usesRecover = true
+		}
+		ctx.nextFuncLitDeferred = true
+		fun = ctx.expr(s.Call.Fun)
+		ctx.nextFuncLitDeferred = false
+	} else {
+		fun = ctx.expr(s.Call.Fun)
+	}
+	expr = glang.LetExpr{
+		Names:   []string{"$f"},
+		ValExpr: fun,
+		Cont:    expr,
+	}
+
+	expr = ctx.callExprPrelude(s.Call, expr)
+	expr = glang.NewDoSeq(expr, cont)
+	return
+}
+
+func (ctx *Ctx) selectStmt(s *ast.SelectStmt, cont glang.Expr) (expr glang.Expr) {
+	var clauses []glang.CommClause
+	var def glang.Expr // nil initially (None)
+
+	var chs []glang.Expr
+
+	// build up select statement itself
+	for i, s := range s.Body.List {
+		s := s.(*ast.CommClause)
+		if s.Comm == nil {
+			// a default: case
+			def = ctx.stmtList(s.Body, nil)
+		} else if c, ok := s.Comm.(*ast.SendStmt); ok {
+			chs = append(chs, ctx.expr(c.Chan))
+
+			clauses = append(clauses, glang.CommClause{
+				Comm: glang.SendCase{
+					ElemType: ctx.glangType(s.Comm, chanElem(ctx.typeOf(c.Chan))),
+					Chan:     glang.IdentExpr(fmt.Sprintf("$ch%d", i)),
+					Value:    glang.IdentExpr(fmt.Sprintf("$v%d", i)),
+				},
+				Body: ctx.stmtList(s.Body, nil),
+			})
+		} else { // must be a receive stmt
+			var recvChan glang.Expr
+			var chanType types.Type
+			body := ctx.stmtList(s.Body, nil)
+
+			// want to figure out the first statment to run in the body
+			switch comm := s.Comm.(type) {
+			case *ast.ExprStmt:
+				recvExpr := comm.X.(*ast.UnaryExpr)
+				if recvExpr.Op != token.ARROW {
+					ctx.nope(comm.X, "expected recv statement")
+				}
+				recvChan = ctx.expr(recvExpr.X)
+				chanType = ctx.typeOf(recvExpr.X)
+				// nothing extra to run in the body
+			case *ast.AssignStmt:
+				// XXX: replace the RHS in the assignment statement with an
+				// ident, so we can put this straight in the the body list
+				if len(comm.Rhs) != 1 {
+					ctx.nope(comm, "expected a single receive operation on RHS")
+				}
+				var rhs ast.Expr = comm.Rhs[0]
+				for {
+					if r, ok := rhs.(*ast.ParenExpr); ok {
+						rhs = r.X
+					} else {
+						break
+					}
+				}
+				recvExpr := rhs.(*ast.UnaryExpr)
+				if recvExpr.Op != token.ARROW {
+					ctx.nope(comm.Rhs[0], "expected recv statement")
+				}
+				recvChan = ctx.expr(recvExpr.X)
+				chanType = ctx.typeOf(recvExpr.X)
+
+				// XXX: create a new AST node and enough typing information for
+				// an assignStmt to translate.
+				t := ctx.info.Types[recvExpr]
+				comm.Rhs[0] = ast.NewIdent("$recvVal")
+				ctx.info.Types[comm.Rhs[0]] = t
+
+				if comm.Tok == token.DEFINE {
+					body = ctx.defineStmt(comm, body)
+				} else if comm.Tok == token.ASSIGN {
+					body = ctx.assignStmt(comm, body)
+				}
+			default:
+				ctx.unsupported(s.Comm, "unexpected statement in select clause")
+			}
+
+			chs = append(chs, recvChan)
+
+			clauses = append(clauses, glang.CommClause{
+				Comm: glang.RecvCase{
+					ElemType: ctx.glangType(s.Comm, chanElem(chanType)),
+					Chan:     glang.IdentExpr(fmt.Sprintf("$ch%d", i)),
+				},
+				Body: glang.FuncLit{
+					Args: []glang.Binder{{Name: "$recvVal"}},
+					Body: body,
+				},
+			})
+		}
+	}
+
+	expr = glang.NewCallExpr(glang.VerbatimExpr("SelectStmt"), glang.SelectStmtClauses{
+		Default: def,
+		Clauses: clauses,
+	})
+
+	// Go evaluates each case's channel, then its send value, in source order.
+	for i := len(chs) - 1; i >= 0; i-- {
+		s := s.Body.List[i].(*ast.CommClause)
+		if c, ok := s.Comm.(*ast.SendStmt); ok {
+			expr = glang.LetExpr{
+				Names:   []string{fmt.Sprintf("$v%d", i)},
+				ValExpr: ctx.expr(c.Value),
+				Cont:    expr,
+			}
+		}
+		expr = glang.LetExpr{
+			Names:   []string{fmt.Sprintf("$ch%d", i)},
+			ValExpr: chs[i],
+			Cont:    expr,
+		}
+	}
+
+	if breaksOut(s.Body) {
+		expr = glang.CatchBreakExpr{Body: expr}
+	}
+	expr = glang.SeqExpr{Expr: expr, Cont: cont}
+	return
+}
+
+func (ctx *Ctx) sendStmt(s *ast.SendStmt, cont glang.Expr) (expr glang.Expr) {
+	elemType := chanElem(ctx.typeOf(s.Chan))
+	expr = glang.NewCallExpr(glang.VerbatimExpr("chan.send"),
+		ctx.glangType(s, elemType),
+		glang.IdentExpr("$chan"),
+		glang.IdentExpr("$v"))
+	// XXX: left-to-right evaluation, might not match Go
+	expr = glang.LetExpr{Names: []string{"$v"},
+		ValExpr: ctx.exprIntoType(s.Value, elemType),
+		Cont:    expr}
+	expr = glang.LetExpr{Names: []string{"$chan"}, ValExpr: ctx.expr(s.Chan), Cont: expr}
+	expr = glang.NewDoSeq(expr, cont)
+	return
+}
+
+func (ctx *Ctx) typeSwitchStmt(s *ast.TypeSwitchStmt, cont glang.Expr) (e glang.Expr) {
+	// s.Assign is either y.(type) or x := y.(type); first extract y (an
+	// expression) and x (if present)
+	var y ast.Expr
+	var x *ast.Ident = nil
+	switch stmt := s.Assign.(type) {
+	case *ast.ExprStmt:
+		y = stmt.X.(*ast.TypeAssertExpr).X
+	case *ast.AssignStmt:
+		if stmt.Tok != token.DEFINE {
+			ctx.nope(stmt, "type switch assign not defining a variable")
+		}
+		y = stmt.Rhs[0].(*ast.TypeAssertExpr).X
+		x = stmt.Lhs[0].(*ast.Ident)
+	default:
+		ctx.nope(stmt, "type switch with unexpected Assign %T", stmt)
+	}
+
+	// Get default handler (if it exists)
+	e = glang.DoExpr{Expr: glang.Tt}
+	for _, c := range s.Body.List {
+		if c := c.(*ast.CaseClause); c.List == nil {
+			e = ctx.stmtList(c.Body, nil)
+			break
+		}
+	}
+
+	for i := len(s.Body.List) - 1; i >= 0; i-- {
+		c := s.Body.List[i].(*ast.CaseClause)
+		if c.List == nil {
+			// default case already handled
+			continue
+		}
+
+		body := ctx.stmtList(c.Body, nil)
+		if x != nil {
+			addAllocation := func(ty glang.Expr) {
+				// in switch x := y.(type), we create a mutable variable for x in
+				// each case's body, since its value is y coerced to the right type
+				// for that case
+				body = glang.LetExpr{
+					Names: []string{x.Name},
+					ValExpr: glang.NewCallExpr(glang.VerbatimExpr("GoAlloc"), ty,
+						glang.IdentExpr("$x")),
+					Cont: body,
+				}
+			}
+			if len(c.List) > 1 {
+				addAllocation(ctx.glangType(y, ctx.typeOf(y)))
+			} else {
+				// The type of x will depend on the case
+
+				if types.Identical(ctx.typeOf(c.List[0]), types.Typ[types.UntypedNil]) {
+					addAllocation(ctx.glangType(y, ctx.typeOf(y)))
+				} else {
+					addAllocation(ctx.glangType(c.List[0], ctx.typeOf(c.List[0])))
+				}
+			}
+		}
+
+		e = glang.IfExpr{Cond: glang.IdentExpr("$ok"), Then: body, Else: e}
+
+		if len(c.List) > 1 {
+			// In this case, the x actually has the same type as y (i.e. x is just y).
+			e = glang.LetExpr{Names: []string{"$x"}, ValExpr: glang.IdentExpr("$y"), Cont: e}
+
+			// The case is taken if y can be converted to any of the types
+			getCond := func(i int) glang.Expr {
+				ty := ctx.typeOf(c.List[i])
+				if b, ok := ty.(*types.Basic); ok && b.Kind() == types.UntypedNil {
+					return glang.BinaryExpr{
+						X: glang.IdentExpr("$y"),
+						Op: glang.BinOp{
+							OpId: glang.OpEquals,
+							Type: ctx.glangType(y, ctx.typeOf(y)),
+						},
+						Y: glang.VerbatimExpr("#interface.nil"),
+					}
+				} else {
+					return glang.NewCallExpr(glang.VerbatimExpr("Snd"),
+						glang.NewCallExpr(glang.VerbatimExpr("TypeAssert2"),
+							ctx.glangType(c.List[i], ty),
+							glang.IdentExpr("$y"),
+						),
+					)
+				}
+			}
+			cond := getCond(0)
+			for i := range c.List[1:] {
+				cond = glang.BinaryExpr{Op: glang.BinOp{
+					OpId: glang.OpLOr,
+					Type: glang.VerbatimExpr("go.bool"),
+				},
+					X: getCond(i), Y: cond}
+			}
+			e = glang.LetExpr{Names: []string{"$ok"}, ValExpr: cond, Cont: e}
+		} else {
+			// In this case, x should have the type equal to the single type listed in this case.
+			ty := ctx.typeOf(c.List[0])
+			if b, ok := ty.(*types.Basic); ok && b.Kind() == types.UntypedNil {
+				e = glang.LetExpr{Names: []string{"$x"}, ValExpr: glang.IdentExpr("$y"), Cont: e}
+				e = glang.LetExpr{
+					Names: []string{"$ok"},
+					ValExpr: glang.BinaryExpr{
+						X: glang.IdentExpr("$y"),
+						Op: glang.BinOp{
+							OpId: glang.OpEquals,
+							Type: ctx.glangType(y, ctx.typeOf(y)),
+						},
+						Y: glang.VerbatimExpr("#interface.nil"),
+					},
+					Cont: e,
+				}
+			} else {
+				e = glang.LetExpr{
+					Names: []string{"$x", "$ok"},
+					ValExpr: glang.NewCallExpr(glang.VerbatimExpr("TypeAssert2"),
+						ctx.glangType(c.List[0], ty),
+						glang.IdentExpr("$y"),
+					),
+					Cont: e,
+				}
+			}
+		}
+	}
+	// the guard is evaluated after the init statement, in its scope
+	e = glang.LetExpr{
+		Names:   []string{"$y"},
+		ValExpr: ctx.expr(y),
+		Cont:    e,
+	}
+	if s.Init != nil {
+		e = glang.ParenExpr{Inner: ctx.stmt(s.Init, e)}
+	}
+	if breaksOut(s.Body) {
+		e = glang.CatchBreakExpr{Body: e}
+	}
+	e = glang.SeqExpr{Expr: e, Cont: cont}
+	return
+}
+
+func (ctx *Ctx) stmt(s ast.Stmt, cont glang.Expr) glang.Expr {
+	switch s := s.(type) {
+	case *ast.ReturnStmt:
+		return ctx.returnStmt(s, cont)
+	case *ast.BranchStmt:
+		return ctx.branchStmt(s, cont)
+	case *ast.IfStmt:
+		return ctx.ifStmt(s, cont)
+	case *ast.GoStmt:
+		return ctx.goStmt(s, cont)
+	case *ast.ExprStmt:
+		if ctx.isBuiltinCall(s.X, "panic") {
+			// `panic(v)` is the outcome `("panic", v)` of the exception monad,
+			// like a `return`: it is not wrapped in `do:` (which would make it an
+			// ordinary statement whose value is dropped).
+			return glang.SeqExpr{Expr: ctx.expr(s.X), Cont: cont}
+		}
+		return glang.NewDoSeq(ctx.expr(s.X), cont)
+	case *ast.AssignStmt:
+		if s.Tok == token.DEFINE {
+			return ctx.defineStmt(s, cont)
+		} else if s.Tok == token.ASSIGN {
+			return ctx.assignStmt(s, cont)
+		} else {
+			return ctx.assignOpStmt(s, cont)
+		}
+	case *ast.DeclStmt:
+		return ctx.varDeclStmt(s, cont)
+	case *ast.IncDecStmt:
+		return ctx.incDecStmt(s, cont)
+	case *ast.ForStmt:
+		// note that this might be a nested loop,
+		// in which case the loop var gets replaced by the inner loop.
+		return ctx.forStmt(s, cont)
+	case *ast.RangeStmt:
+		return glang.SeqExpr{Expr: ctx.rangeStmt(s), Cont: cont}
+	case *ast.BlockStmt:
+		return ctx.blockStmt(s, cont)
+	case *ast.SwitchStmt:
+		return ctx.switchStmt(s, cont)
+	case *ast.TypeSwitchStmt:
+		return ctx.typeSwitchStmt(s, cont)
+	case *ast.DeferStmt:
+		return ctx.deferStmt(s, cont)
+	case *ast.SelectStmt:
+		return ctx.selectStmt(s, cont)
+	case *ast.SendStmt:
+		return ctx.sendStmt(s, cont)
+	default:
+		ctx.unsupported(s, "statement %T", s)
+	}
+	panic("unreachable")
+}
+
+func funcName(f *types.Func) string {
+	return util.FuncName(f)
+}
+
+// Returns a glang.FuncDecl and maybe also a glang.NameDecl. If the function is an `init` or `_`, this
+// returns None.
+func (ctx *Ctx) funcDecl(d *ast.FuncDecl) {
+	ctx.curFuncType = ctx.typeOf(d.Name).(*types.Signature)
+	defer func() {
+		ctx.curFuncType = nil
+	}()
+
+	funcName := funcName(ctx.info.ObjectOf(d.Name).(*types.Func))
+	if funcName == "_" {
+		return
+	}
+
+	if d.Recv == nil {
+		// Always emit func name decl, even if the function is trusted or axiomatized.
+		funcId := ctx.info.Defs[d.Name].Pkg().Path() + "." + ctx.info.Defs[d.Name].Name()
+		if d.Name.Name != "init" {
+			ctx.out.funcDecls = append(ctx.out.funcDecls, glang.ConstDecl{
+				Name: d.Name.Name,
+				Val:  glang.StringLiteral{Value: funcId},
+				Type: glang.VerbatimExpr("go_string"),
+			})
+			ctx.functions = append(ctx.functions, d)
+		}
+	}
+
+	if d.Recv == nil && d.Name.Name == "init" && ctx.filter.GetAction(funcName) == declfilter.Trust {
+		// A trusted init's model is `init.impl` in the package's trusted code,
+		// run in the init's place; one name cannot stand for several inits.
+		if ctx.trustedInit {
+			ctx.unsupported(d, "more than one trusted init function")
+		}
+		ctx.trustedInit = true
+		ctx.inits = append(ctx.inits, glang.VerbatimExpr("init.impl"))
+		return
+	}
+
+	if ctx.filter.GetAction(funcName) != declfilter.Translate {
+		return
+	}
+
+	// A type declared in a translated function is translated as a package-level
+	// type of the same name, which must therefore be unique in the package.
+	for _, g := range util.TypeDecls(d) {
+		for _, spec := range g.Specs {
+			spec := spec.(*ast.TypeSpec)
+			name := spec.Name.Name
+			if ctx.localTypes[name] || ctx.info.Defs[spec.Name].Pkg().Scope().Lookup(name) != nil {
+				ctx.unsupported(spec, "local type %s: the name is not unique in the package", name)
+			}
+			ctx.localTypes[name] = true
+			ctx.typeDecl(spec)
+		}
+	}
+
+	ctx.usesRecover = false
+	ctx.recoverOK = false
+	ctx.nextFuncLitDeferred = false
+	var fd glang.FuncDecl
+	addSourceDoc(d.Doc, &fd.Comment)
+	ctx.addSourceFile(d, &fd.Comment)
+
+	maybeAddReceiver := func() {}
+	if d.Recv != nil {
+		if len(d.Recv.List) != 1 {
+			ctx.nope(d, "function with multiple receivers")
+		}
+		receiver := d.Recv.List[0]
+		recvType := types.Unalias(ctx.typeOf(receiver.Type))
+		// recvType must be either a "named" type or a pointer type that points to a named type.
+		if baseType, ok := recvType.(*types.Pointer); ok {
+			recvType = baseType.Elem()
+		}
+		namedType, ok := recvType.(*types.Named)
+		if !ok {
+			ctx.nope(d.Recv, "expected named type as method receiver, got %T", recvType)
+		}
+		for i := range namedType.TypeArgs().Len() {
+			arg := namedType.TypeArgs().At(i)
+			if arg, ok := arg.(*types.TypeParam); ok {
+				fd.TypeArgs = append(fd.TypeArgs, glang.TermIdent(arg.Obj().Name()))
+			} else {
+				// it doesn't seem possible to have the receiver be a specialized
+				// generic type (all args are interpreted as bound parameters)
+				ctx.nope(d, "instantiated type argument in function with non-parameter")
+			}
+		}
+		typeName := namedType.Obj().Name()
+
+		fd.Name = glang.TypeMethod(typeName, d.Name.Name)
+
+		name := "_"
+		if len(receiver.Names) > 0 {
+			name = receiver.Names[0].Name
+		}
+		fd.RecvArg = &glang.Binder{Name: name}
+		if name != "_" && name != "" {
+			maybeAddReceiver = func() {
+				fd.Body = glang.LetExpr{
+					Names: []string{name},
+					ValExpr: glang.NewCallExpr(
+						glang.VerbatimExpr("GoAlloc"),
+						ctx.glangType(receiver, ctx.typeOf(receiver.Type)),
+						glang.IdentExpr(name)),
+					Cont: fd.Body,
+				}
+			}
+		}
+	} else {
+		fd.Name = glang.FuncImpl(d.Name.Name)
+		switch ctx.filter.GetAction(funcName) {
+		case declfilter.Trust:
+			return
+		case declfilter.Axiomatize:
+			return
+		}
+		if d.Type.TypeParams != nil {
+			for _, p := range d.Type.TypeParams.List {
+				for _, name := range p.Names {
+					fd.TypeArgs = append(fd.TypeArgs, glang.TermIdent(name.Name))
+				}
+			}
+		}
+	}
+
+	if d.Body == nil {
+		ctx.unsupported(d, "external function")
+	}
+
+	ctx.beginFuncBody(d.Body, d.Type.Results)
+
+	var cont glang.Expr = nil
+	if d.Type.Results == nil {
+		// explicitly return #() at end of void functions
+		cont = glang.ReturnExpr{Value: glang.Tt}
+	}
+	body := ctx.blockStmt(d.Body, cont)
+
+	if d.Name.Name == "init" {
+		if ctx.usesRecover {
+			ctx.unsupported(d, "recover() in a package init function")
+		}
+		if ctx.usesDefer {
+			body = glang.NewCallExpr(glang.VerbatimExpr("with_defer:"), glang.Tt, body)
+		} else {
+			body = glang.NewCallExpr(glang.VerbatimExpr("exception_do"), body)
+		}
+		f := glang.FuncLit{Args: nil, Body: body}
+		ctx.inits = append(ctx.inits, f)
+		return
+	}
+
+	fd.Body = body
+	var argTypes []glang.Expr
+	fd.Args, argTypes = ctx.paramList(d.Type.Params)
+
+	for i, arg := range fd.Args {
+		if arg.Name != "_" && arg.Name != "" {
+			fd.Body = glang.LetExpr{
+				Names: []string{arg.Name},
+				ValExpr: glang.NewCallExpr(
+					glang.VerbatimExpr("GoAlloc"),
+					argTypes[i], glang.IdentExpr(arg.Name)),
+				Cont: fd.Body,
+			}
+		}
+	}
+	maybeAddReceiver()
+	fd.Body = ctx.wrapFuncBody(fd.Body, d.Type.Results)
+
+	ctx.out.funcImplDecls = append(ctx.out.funcImplDecls, fd)
+}
+
+// this should only be used for untyped constant literals
+func (ctx *Ctx) constantLiteral(e ast.Expr) glang.Expr {
+	val := ctx.info.Types[e].Value
+	if e, ok := e.(*ast.Ident); ok {
+		val = ctx.info.ObjectOf(e).(*types.Const).Val()
+	}
+	return ctx.constantValue(e, val, ctx.typeOf(e))
+}
+
+// constantValue is the constant val at type t.
+func (ctx *Ctx) constantValue(e locatable, val constant.Value, t types.Type) glang.Expr {
+	// FIXME: emit `Convert` rather than doing it all statically here.
+	v := constant.Val(val)
+	constInt := func(cons string) glang.Expr {
+		switch v := v.(type) {
+		case *big.Int:
+			return glang.ToVal{Value: glang.NewCallExpr(glang.VerbatimExpr(cons), glang.ZLiteral{Value: v})}
+		case int64:
+			return glang.ToVal{Value: glang.NewCallExpr(glang.VerbatimExpr(cons), glang.ZLiteral{Value: big.NewInt(v)})}
+		}
+		ctx.nope(e, "expected integer constant")
+		return nil
+	}
+
+	switch t := t.Underlying().(type) {
+	case *types.Basic:
+		switch t.Kind() {
+		case types.Bool, types.UntypedBool:
+			return glang.GooseBoolLiteral(v.(bool))
+		case types.Uint64, types.Int64, types.Int, types.Uint, types.Uintptr:
+			return constInt("W64")
+		case types.Uint32, types.Int32:
+			return constInt("W32")
+		case types.Uint16, types.Int16:
+			return constInt("W16")
+		case types.Uint8, types.Int8:
+			return constInt("W8")
+		case types.String, types.UntypedString:
+			return glang.ToVal{Value: glang.StringLiteral{Value: v.(string)}}
+		case types.UntypedNil:
+			return glang.VerbatimExpr("UntypedNil")
+		case types.UntypedInt, types.UntypedRune:
+			switch v := v.(type) {
+			case *big.Int:
+				return glang.ToVal{Value: glang.ZLiteral{Value: v}}
+			case int64:
+				return glang.ToVal{Value: glang.ZLiteral{Value: big.NewInt(v)}}
+			}
+		case types.Float64, types.UntypedFloat:
+			f, _ := constant.Float64Val(val)
+			bits := math.Float64bits(f)
+			return glang.Int64Val{Value: glang.ZLiteral{Value: new(big.Int).SetUint64(bits)}}
+		case types.Float32:
+			f, _ := constant.Float32Val(val)
+			bits := math.Float32bits(f)
+			return glang.Int32Val{Value: glang.ZLiteral{Value: new(big.Int).SetUint64(uint64(bits))}}
+		}
+	}
+	ctx.unsupported(e, "unsupported constant val")
+	return nil
+}
+
+// constSpec handles one specification in a const block
+func (ctx *Ctx) constSpec(spec *ast.ValueSpec) {
+	// Note that a spec is one line, typically something like `C = 1` or maybe just C
+	// if using iota, and spec.Names has more than 1 item only for something like
+	// `C, D = 2, 3`.
+	for i := range spec.Names {
+		if spec.Names[i].Name == "_" {
+			continue
+		}
+		switch ctx.filter.GetAction(spec.Names[i].Name) {
+		case declfilter.Axiomatize:
+			ctx.out.constDecls = append(ctx.out.constDecls, glang.AxiomDecl{DeclName: spec.Names[i].Name,
+				Type: glang.VerbatimExpr("val"),
+			})
+		case declfilter.Translate:
+			func() {
+				cd := glang.ConstDecl{
+					Name: spec.Names[i].Name,
+				}
+				// copy the line comment only to the first one
+				if i == 0 {
+					addSourceDoc(spec.Comment, &cd.Comment)
+				}
+				cd.Val = ctx.constantLiteral(spec.Names[i])
+				cd.Type = glang.VerbatimExpr("val")
+				ctx.out.constDecls = append(ctx.out.constDecls, cd)
+			}()
+		}
+	}
+}
+
+func (ctx *Ctx) constDecl(d *ast.GenDecl) {
+	for _, spec := range d.Specs {
+		ctx.constSpec(spec.(*ast.ValueSpec))
+	}
+}
+
+// functionConstSpec translates constant declarations within functions, which
+// become GooseLang let bindings (unlike constSpec, which creates Lean
+// definitions); supports untyped ints (unlike varSpec)
+func (ctx *Ctx) functionConstSpec(spec *ast.ValueSpec, cont glang.Expr) glang.Expr {
+	var e glang.Expr = cont
+	// Note that a spec is one line, typically something like `C = 1` or maybe just C
+	// if using iota, and spec.Names has more than 1 item only for something like
+	// `C, D = 2, 3`.
+
+	// reverse iteration order because each expression uses the previous as a
+	// continuation
+	for i := len(spec.Names) - 1; i >= 0; i-- {
+		if spec.Names[i].Name == "_" {
+			continue
+		}
+		constVal := ctx.constantLiteral(spec.Names[i])
+		e = glang.TermLetExpr{
+			Name:    spec.Names[i].Name,
+			ValExpr: constVal,
+			Cont:    e,
+		}
+	}
+	return e
+}
+
+func (ctx *Ctx) globalVarDecl(d *ast.GenDecl) {
+	for _, spec := range d.Specs {
+		s := spec.(*ast.ValueSpec)
+		for _, name := range s.Names {
+			if name.Name == "_" {
+				continue
+			}
+			ctx.out.varDecls = append(ctx.out.varDecls, glang.ConstDecl{
+				Name: name.Name,
+				Val: glang.StringLiteral{
+					Value: ctx.info.Defs[name].Pkg().Path() + "." + ctx.info.Defs[name].Name(),
+				},
+				Type: glang.VerbatimExpr("go_string"),
+			})
+			switch ctx.filter.GetAction(name.Name) {
+			case declfilter.Translate:
+				ctx.globalVars = append(ctx.globalVars, name)
+			default:
+				if s.Values != nil {
+					ctx.out.varDecls = append(ctx.out.varDecls, glang.AxiomDecl{
+						DeclName: name.Name + "'init",
+						Type:     glang.VerbatimExpr("val"),
+					})
+				}
+			}
+		}
+	}
+}
+
+func stringLitValue(lit *ast.BasicLit) string {
+	if lit.Kind != token.STRING {
+		panic("unexpected non-string literal")
+	}
+	s, err := strconv.Unquote(lit.Value)
+	if err != nil {
+		panic("unexpected string literal value: " + err.Error())
+	}
+	return s
+}
+
+func importSuffixAlias(pkgPath string, suffixLen int) string {
+	parts := strings.Split(glang.GoPathToIdentPath(pkgPath), "/")
+	if suffixLen > len(parts) {
+		suffixLen = len(parts)
+	}
+	return glang.ToIdent(strings.Join(parts[len(parts)-suffixLen:], "_"))
+}
+
+// uniqueImportAliases assigns aliases (used in the names of the Assumptions
+// class fields) for imports whose Go package names collide. It tries
+// increasingly long import-path suffixes until every package gets a unique
+// identifier that also avoids refs already present in used.
+//
+// For example, imports ending in "a/v1" and "b/v1" both have package name "v1",
+// so the one-component suffix "v1" conflicts and the two-component suffixes
+// become "a_v1" and "b_v1". If imports ended in "x/a/v1" and "y/a/v1",
+// "a_v1" would still conflict, so the aliases would become "x_a_v1" and
+// "y_a_v1".
+func uniqueImportAliases(pkgs []*types.Package, used map[string]bool) map[string]string {
+	aliases := make(map[string]string)
+	if len(pkgs) == 0 {
+		return aliases
+	}
+
+	maxParts := 0
+	for _, pkg := range pkgs {
+		if n := len(strings.Split(glang.GoPathToIdentPath(pkg.Path()), "/")); n > maxParts {
+			maxParts = n
+		}
+	}
+
+	for suffixLen := 1; suffixLen <= maxParts; suffixLen++ {
+		counts := make(map[string]int)
+		candidates := make(map[string]string)
+		for _, pkg := range pkgs {
+			alias := importSuffixAlias(pkg.Path(), suffixLen)
+			candidates[pkg.Path()] = alias
+			counts[alias]++
+		}
+
+		ok := true
+		for _, alias := range candidates {
+			if counts[alias] != 1 || used[alias] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			for path, alias := range candidates {
+				aliases[path] = alias
+			}
+			return aliases
+		}
+	}
+
+	// If no common suffix length worked, fall back to the full-path alias for
+	// each package and append numeric suffixes only when that full-path alias is
+	// already taken.
+	for _, pkg := range pkgs {
+		base := importSuffixAlias(pkg.Path(), maxParts)
+		alias := base
+		for n := 0; used[alias]; n++ {
+			alias = fmt.Sprintf("%s_%d", base, n)
+		}
+		aliases[pkg.Path()] = alias
+		used[alias] = true
+	}
+	return aliases
+}
+
+func (ctx *Ctx) imports(d []ast.Spec) {
+	for _, s := range d {
+		s := s.(*ast.ImportSpec)
+		importPath := stringLitValue(s.Path)
+		if !ctx.filter.ShouldImport(importPath) {
+			continue
+		}
+
+		n := ctx.info.PkgNameOf(s)
+		if _, ok := ctx.importNames[n.Imported().Path()]; !ok {
+			ctx.importNames[n.Imported().Path()] = n
+			ctx.importNamesOrdered = append(ctx.importNamesOrdered, n)
+			ctx.out.importDecls = append(ctx.out.importDecls, glang.ImportDecl{Path: importPath})
+		}
+	}
+}
+
+func (ctx *Ctx) finalizeImports() {
+	// First group imports by their Go package name. Different import paths can
+	// still have the same package name, for example "a/v1" and "b/v1" can both
+	// declare package "v1".
+	importsByName := make(map[string][]*types.Package)
+	for _, impName := range ctx.importNamesOrdered {
+		pkg := impName.Imported()
+		importsByName[pkg.Name()] = append(importsByName[pkg.Name()], pkg)
+	}
+
+	// Imports with unique package names are referred to by their package name.
+	usedRefs := make(map[string]bool)
+	for _, impName := range ctx.importNamesOrdered {
+		pkg := impName.Imported()
+		if len(importsByName[pkg.Name()]) == 1 {
+			ref := glang.ToIdent(pkg.Name())
+			ctx.importAssumptions[pkg.Path()] = "import_" + ref + "_Assumption"
+			usedRefs[ref] = true
+		}
+	}
+
+	// Imports with colliding package names get path-suffix aliases.
+	seenName := make(map[string]bool)
+	for _, impName := range ctx.importNamesOrdered {
+		pkg := impName.Imported()
+		name := pkg.Name()
+		group := importsByName[name]
+		if len(group) == 1 || seenName[name] {
+			continue
+		}
+		seenName[name] = true
+
+		aliases := uniqueImportAliases(group, usedRefs)
+		for _, groupPkg := range group {
+			ref := aliases[groupPkg.Path()]
+			ctx.importAssumptions[groupPkg.Path()] = "import_" + ref + "_Assumption"
+			usedRefs[ref] = true
+		}
+	}
+}
+
+func (ctx *Ctx) pkgRef(pkg *types.Package) string {
+	if pkg == nil {
+		return ""
+	}
+	// Lean namespaces are global, so packages are referred to by their full
+	// (unique) namespace; see glang.LeanNamespace. This is unquoted since it is
+	// quoted when printed.
+	//
+	// References are rooted (`_root_.Perennial.<ns>`): a relative reference
+	// `errors.X` from inside namespace `a.errors` would resolve to
+	// `a.errors.X`.
+	path := pkg.Path()
+	if _, ok := ctx.importNames[path]; !ok && path != ctx.pkgPath {
+		// Not imported (filtered out by the config): refer to an imported
+		// package with the same name, if any.
+		for _, n := range ctx.importNamesOrdered {
+			if n.Imported().Name() == pkg.Name() {
+				path = n.Imported().Path()
+				break
+			}
+		}
+	}
+	return "_root_.Perennial." + strings.ReplaceAll(glang.GoPathToIdentPath(path), "/", ".")
+}
+
+func (ctx *Ctx) importAssumptionName(pkg *types.Package) string {
+	if name, ok := ctx.importAssumptions[pkg.Path()]; ok {
+		return name
+	}
+	return "import_" + glang.ToIdent(pkg.Name()) + "_Assumption"
+}
+
+func (ctx *Ctx) decl(d ast.Decl) {
+	switch d := d.(type) {
+	case *ast.FuncDecl:
+		ctx.funcDecl(d)
+	case *ast.GenDecl:
+		switch d.Tok {
+		case token.IMPORT:
+			// Imports are pre-scanned in Ctx.files so package-wide aliases are
+			// finalized before declaration translation. Ignore them here to keep
+			// decl safe to call on every top-level declaration.
+			return
+		case token.CONST:
+			ctx.constDecl(d)
+		case token.VAR:
+			ctx.globalVarDecl(d)
+		case token.TYPE:
+			for _, spec := range d.Specs {
+				ctx.typeDecl(spec.(*ast.TypeSpec))
+			}
+		default:
+			ctx.nope(d, "unknown token type in decl")
+		}
+	case *ast.BadDecl:
+		ctx.nope(d, "bad declaration in type-checked code")
+	default:
+		ctx.nope(d, "top-level decl")
+	}
+}
+
+func (ctx *Ctx) packagePropClass() []glang.Decl {
+	var decls = []glang.Decl{}
+
+	// toposort named types specs
+	nameToTypeSpecMap := make(map[string]*ast.TypeSpec)
+	for _, t := range ctx.namedTypeSpecs {
+		nameToTypeSpecMap[t.Name.Name] = t
+	}
+	for t := range toposort.ToposortSeq(slices.Values(ctx.namedTypeSpecs),
+		func(s *ast.TypeSpec) iter.Seq[*ast.TypeSpec] {
+			return func(yield func(s *ast.TypeSpec) bool) {
+				if ctx.filter.GetAction(s.Name.Name) == declfilter.Axiomatize {
+					return
+				}
+				for n := range util.TypeGetDependencies(ctx.pkgPath, ctx.typeOf(s.Type)) {
+					if t, ok := nameToTypeSpecMap[n]; ok {
+						if !yield(t) {
+							return
+						}
+					}
+				}
+			}
+		},
+		func(cycle []*ast.TypeSpec) {
+			s := "cycle: "
+			sep := ""
+			for _, t := range cycle {
+				s += sep + t.Name.Name
+				sep = "-> "
+			}
+			ctx.unsupported(cycle[0], "%s", s)
+		}) {
+		decls = append(decls, ctx.namedTypeSemanticsDecl(t)...)
+	}
+
+	decls = append(decls, glang.VerbatimDecl{Content: ctx.leanPackagePropClass(ctx.namedTypeSpecs)})
+
+	return decls
+}
+
+// After using Ctx to translate every decl, this will return the extra decls
+// that should be added to the accumulated set of glang.Decls.
+func (ctx *Ctx) finalExtraDecls() {
+	var decls = []glang.Decl{}
+
+	decls = append(decls, glang.VerbatimDecl{Content: ctx.leanInfoInstance()})
+
+	initFunc := glang.FuncDecl{Name: "initialize'"}
+
+	var e glang.Expr
+
+	// add all init() function bodies
+	for i := range ctx.inits {
+		init := ctx.inits[len(ctx.inits)-i-1]
+		e = glang.NewDoSeq(glang.NewCallExpr(init, glang.Tt), e)
+	}
+
+	if ctx.filter.GetAction("_") != declfilter.Translate {
+		decls = append(decls, glang.AxiomDecl{
+			DeclName: "_'init",
+			Type:     glang.VerbatimExpr("val"),
+		})
+	}
+
+	// initialize all global vars
+InitLoop:
+	for i := range ctx.info.InitOrder {
+		init := ctx.info.InitOrder[len(ctx.info.InitOrder)-i-1]
+
+		// Check if any of the LHS variables should be treated as axiomatized
+		for i := 0; i < len(init.Lhs); i++ {
+			varName := init.Lhs[i].Name()
+			if ctx.filter.GetAction(varName) != declfilter.Translate {
+				e = glang.NewDoSeq(
+					glang.NewCallExpr(ctx.termIdent(varName+"'init"), glang.Tt),
+					e)
+				continue InitLoop
+			}
+		}
+
+		// Execute assignments left-to-right
+		for i := len(init.Lhs); i > 0; i-- {
+			if init.Lhs[i-1].Name() != "_" {
+				e = glang.NewDoSeq(
+					glang.StoreStmt{
+						Dst: glang.NewCallExpr(glang.VerbatimExpr("GlobalVarAddr"),
+							ctx.termIdent(init.Lhs[i-1].Name()), glang.Tt,
+						),
+						X:  glang.IdentExpr(fmt.Sprintf("$r%d", i-1)),
+						Ty: ctx.glangType(init.Lhs[i-1], init.Lhs[i-1].Type()),
+					}, e)
+			}
+		}
+		if e == nil {
+			e = glang.DoExpr{Expr: glang.Tt}
+		}
+
+		// Determine RHS types, specially handling multiple returns from a function call.
+		var rhsTypes []types.Type
+		t := ctx.typeOf(init.Rhs)
+		if tuple, ok := t.(*types.Tuple); ok {
+			for i := range tuple.Len() {
+				rhsTypes = append(rhsTypes, tuple.At(i).Type())
+			}
+		} else {
+			rhsTypes = append(rhsTypes, t)
+		}
+
+		// collect the RHS expressions
+		var rhsExprs []glang.Expr
+		if 1 == len(init.Lhs) {
+			rhsExprs = append(rhsExprs, ctx.expr(init.Rhs))
+		} else {
+			// RHS is a function call returning multiple things. Will introduce
+			// extra let bindings to destructure those multiple returns.
+			for i := range init.Lhs {
+				rhsExprs = append(rhsExprs, glang.IdentExpr(fmt.Sprintf("$ret%d", i)))
+			}
+		}
+
+		// Let bindings for RHSs including conversions
+		for i := len(init.Lhs); i > 0; i-- {
+			e = glang.LetExpr{
+				Names: []string{fmt.Sprintf("$r%d", i-1)},
+				ValExpr: ctx.handleImplicitConversion(init.Lhs[i-1], rhsTypes[i-1],
+					init.Lhs[i-1].Type(), rhsExprs[i-1]),
+				Cont: e,
+			}
+		}
+
+		// Extra let bindings in case RHS is a multiple-returning function
+		if 1 != len(init.Lhs) {
+			var n []string
+			for i := range init.Lhs {
+				n = append(n, fmt.Sprintf("$ret%d", i))
+			}
+			e = glang.LetExpr{
+				Names:   n,
+				ValExpr: ctx.exprSpecial(init.Rhs, true),
+				Cont:    e,
+			}
+		}
+	}
+
+	for _, importName := range ctx.importNamesOrdered {
+		pkg := importName.Imported()
+		e = glang.NewDoSeq(
+			glang.NewCallExpr(
+				ctx.termIdent(ctx.pkgRef(pkg)+"."+"initialize'"),
+				glang.Tt),
+			e)
+	}
+
+	if e == nil {
+		e = glang.DoExpr{Expr: glang.Tt}
+	}
+
+	for _, varIdent := range ctx.globalVars {
+		e = glang.NewDoSeq(
+			glang.NewCallExpr(
+				glang.VerbatimExpr("go.GlobalAlloc"),
+				glang.TermIdent(varIdent.Name),
+				ctx.glangType(varIdent, ctx.typeOf(varIdent)),
+				glang.Tt,
+			),
+			e)
+	}
+
+	e = glang.NewCallExpr(glang.VerbatimExpr("exception_do"), e)
+	e = glang.NewCallExpr(glang.VerbatimExpr("package.init"),
+		glang.VerbatimExpr(ctx.pkgIdent), // LeanPkgId has already rendered this name.
+		glang.FuncLit{Args: nil, Body: e},
+	)
+
+	initFunc.Body = e
+	decls = append(decls, initFunc)
+
+	decls = append(decls, ctx.packagePropClass()...)
+	ctx.out.finalDecls = decls
+}

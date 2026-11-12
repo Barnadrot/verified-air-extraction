@@ -1,0 +1,4 @@
+translate = ["Constraint", "Constraint*.Name"]
+translate_types = true
+trusted = []
+trust_proofgen = false

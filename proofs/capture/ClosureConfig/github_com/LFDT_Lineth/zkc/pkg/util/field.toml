@@ -1,0 +1,6 @@
+translate = ["!*"]
+translate_types = true
+trusted = []
+trust_proofgen = false
+
+imports = ["math/big", "github.com/LFDT-Lineth/zkc/pkg/util/word"]

@@ -1,0 +1,39 @@
+name = "divrem_fv"
+version = "0.1.0"
+defaultTargets = ["DivRemFV", "air_reader", "air_bind", "term_wire_reader", "artifact_reader"]
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4.git"
+rev = "c5ea00351c28e24afc9f0f84379aa41082b1188f"
+
+[[require]]
+name = "Lean_RV64D"
+path = "../../work/sail-reference/sail-riscv-lean-51c635c460125ac87955d061fcd902ce03b8011f"
+
+[[lean_lib]]
+name = "DivRemFV"
+
+[[lean_exe]]
+name = "air_reader"
+root = "Main"
+
+[[lean_exe]]
+name = "air_bind"
+root = "BindMain"
+
+[[lean_exe]]
+name = "term_wire_reader"
+root = "WireMain"
+
+[[lean_exe]]
+name = "artifact_reader"
+root = "ArtifactMain"
+
+[[lean_exe]]
+name = "replay_input_check"
+root = "ReplayDump"
+
+[[lean_exe]]
+name = "trace_semantics"
+root = "TraceMain"

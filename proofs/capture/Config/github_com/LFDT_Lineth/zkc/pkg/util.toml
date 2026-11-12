@@ -1,0 +1,4 @@
+translate = ["Option", "Option*.HasValue", "Option*.Unwrap"]
+translate_types = true
+trusted = []
+trust_proofgen = false

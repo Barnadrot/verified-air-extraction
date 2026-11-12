@@ -1,0 +1,4 @@
+translate = ["MaxUint"]
+imports = ["!*"]
+trusted = []
+trust_proofgen = false
