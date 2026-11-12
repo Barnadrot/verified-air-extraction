@@ -1,0 +1,14 @@
+**/.lake/
+**/__pycache__/
+*.pyc
+/work/
+/proofs/divrem/artifacts/
+/proofs/capture/perennial/
+/proofs/capture/Generated/
+/proofs/capture/ClosureGenerated/
+*.exe
+*.o
+*.a
+/build-evidence/
+
+/evidence/

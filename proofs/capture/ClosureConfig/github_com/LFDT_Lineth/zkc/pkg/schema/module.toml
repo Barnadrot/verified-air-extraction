@@ -1,0 +1,6 @@
+translate = ["Name"]
+translate_types = true
+trusted = []
+trust_proofgen = false
+
+imports = ["github.com/LFDT-Lineth/zkc/*", "math", "math/big", "math/bits", "fmt", "io", "strings", "bytes", "cmp", "errors", "iter"]

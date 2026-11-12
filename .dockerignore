@@ -1,0 +1,9 @@
+.git
+work
+**/.lake
+**/__pycache__
+proofs/divrem/artifacts
+proofs/capture/perennial
+proofs/capture/Generated
+proofs/capture/ClosureGenerated
+build-evidence

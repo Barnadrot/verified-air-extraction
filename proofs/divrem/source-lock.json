@@ -1,0 +1,22 @@
+{
+  "lineth_commit": "2737d8c6b0cdba2b54c195aa6c10958538c5f3e4",
+  "zkc_module_version": "v1.2.33",
+  "zkc_commit": "7ec8b85a95fb681f0756634bdf33be382c661f32",
+  "go_version": "go1.27.1",
+  "lean_version": "4.30.0",
+  "sail_commit": "9f192a57f2bae9b6c34ac13bfe1fd75b77b616b1",
+  "sail_profile": "RV64 source pin. Local generation failed; published Lean model is pinned separately.",
+  "sail_lean_reference_repository": "https://github.com/opencompl/sail-riscv-lean",
+  "sail_lean_reference_commit": "51c635c460125ac87955d061fcd902ce03b8011f",
+  "sail_lean_runtime_commit": "079463134b9c50450b8393e1566a09fc492a34d9",
+  "sail_lean_original_toolchain": "4.29.0",
+  "sail_lean_checked_toolchain": "4.30.0",
+  "sail_lean_source_pin_correspondence": "not established",
+  "sail_lean_compiler_pin": "not recorded by the published model",
+  "sail_lean_translation_trust": "Published Sail-to-Lean output and its runtime; no proof of the Sail compiler",
+  "purpose": "Build provenance. This record is not correspondence evidence or approval.",
+  "mathlib_version": "v4.30.0",
+  "mathlib_commit": "c5ea00351c28e24afc9f0f84379aa41082b1188f",
+  "source_lean_version": "4.34.1",
+  "perennial_commit": "b09644c2004b11847c8d24e57d14e34bb02e3d06"
+}

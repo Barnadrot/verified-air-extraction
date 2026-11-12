@@ -1,0 +1,5 @@
+translate = ["Expr", "Constant", "RegisterAccess", "Add", "Sub", "Mul", "RegisterAccess*.Register", "RegisterAccess*.RelativeShift"]
+trusted = []
+translate_types = true
+trust_proofgen = false
+

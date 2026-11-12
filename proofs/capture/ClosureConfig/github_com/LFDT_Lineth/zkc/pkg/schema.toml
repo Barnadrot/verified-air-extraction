@@ -1,0 +1,6 @@
+translate = ["Table", "UniformSchema", "Constraint", "Assignment", "Table*.Name", "Table*.IsStatic", "Table*.IsNative", "Table*.Registers", "Table*.StaticContents", "Table*.RawConstraints", "UniformSchema*.RawModules"]
+translate_types = true
+trusted = []
+trust_proofgen = false
+
+imports = ["github.com/LFDT-Lineth/zkc/*", "math", "math/big", "math/bits", "fmt", "io", "strings", "bytes", "cmp", "errors", "iter"]

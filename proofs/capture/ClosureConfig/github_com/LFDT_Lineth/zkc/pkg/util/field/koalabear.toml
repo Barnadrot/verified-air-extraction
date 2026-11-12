@@ -1,0 +1,5 @@
+translate = ["Element", "Modulus", "r", "negModulusInvModR", "montgomeryReduce", "Element.ToUint32", "Element.Uint64"]
+trusted = []
+translate_types = true
+trust_proofgen = false
+imports = ["math/bits"]

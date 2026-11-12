@@ -1,0 +1,16 @@
+name = "air_capture_probe"
+version = "0.1.0"
+defaultTargets = ["AirCapture"]
+
+[[require]]
+name = "perennial"
+path = "perennial"
+
+[[lean_lib]]
+name = "AirCapture"
+
+[[lean_lib]]
+name = "CaptureClosure"
+
+[[lean_lib]]
+name = "CaptureSyntax"

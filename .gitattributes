@@ -1,0 +1,2 @@
+# These reviewed translator files have raw-byte checksum pins.
+patches/perennial/** -text

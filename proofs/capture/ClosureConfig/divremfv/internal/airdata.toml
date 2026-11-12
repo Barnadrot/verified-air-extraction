@@ -1,0 +1,13 @@
+translate = ["ExportTerm", "Export", "uintRef", "lookupVector", "busVector", "Term", "Column", "Module", "Vector", "Constraint", "Artifact", "Modulus", "EncodeTermWire", "appendWireWord", "appendArgsWire", "appendTermWire", "EncodeArtifactWire", "appendWireBool", "appendWireOption", "appendWireName", "appendWirePorts", "appendWireColumn", "appendWireRow", "appendWireModule", "appendWireConstraint", "appendWirePort", "captureError", "captureError.Error", "exportColumn", "exportStaticRow", "exportModule", "exportConstraint", "exportColumnIDs", "appendWireModules", "appendWireConstraints", "appendWireColumns", "appendWireRows", "appendWireDomain", "appendWireFramedTerm", "exportColumns", "exportStaticRows", "exportDomain", "exportLookupVectors", "exportBusPorts", "exportModules", "exportModuleConstraints", "exportAllConstraints"]
+trusted = []
+trust_proofgen = false
+translate_types = true
+
+
+
+
+
+
+
+
+imports = ["github.com/LFDT-Lineth/zkc/*", "math", "math/big", "math/bits", "fmt", "io", "strings", "bytes", "cmp", "errors", "iter"]
